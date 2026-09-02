@@ -53,7 +53,7 @@ The rendezvous server can run beside `pubky-homeserver`, behind the same reverse
 
 ## Quick local run
 
-Rust 1.89+ is required.
+Rust 1.91+ is required.
 
 ```bash
 cargo run -p hole-punchky -- init \

@@ -1656,7 +1656,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "futures-util",
- "hmac 0.12.1",
+ "hmac 0.13.0",
  "hole-punchky-protocol",
  "pubky",
  "reqwest 0.12.28",

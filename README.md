@@ -22,8 +22,9 @@ sequenceDiagram
     R-->>B: opaque ciphertext
     B-->>R: HPKE(answer + ICE candidates)
     R-->>A: opaque ciphertext
-    A->>T: ICE connectivity checks
-    B->>T: ICE connectivity checks
+    A->>T: gather public/relay candidates
+    B->>T: gather public/relay candidates
+    A<<->>B: ICE connectivity checks
     A<<->>B: direct DTLS/SCTP DataChannel, or TURN relay
 ```
 
@@ -48,8 +49,8 @@ The rendezvous server can run beside `pubky-homeserver`, behind the same reverse
 - Native Rust client using ICE, DTLS, SCTP, and binary/text WebRTC DataChannels.
 - Direct-versus-relayed path reporting from the nominated local ICE candidate.
 - Health, public configuration, and Prometheus metrics endpoints.
-- Docker deployment for the sidecar and coturn.
-- Unit, live-WebSocket, direct-ICE, TURN-only, CLI, and Pubky-testnet test paths.
+- Docker deployment for the sidecar plus separate STUN and authenticated TURN listeners.
+- Unit, live-WebSocket, direct-ICE, two-NAT namespace, TURN-only, CLI, and Pubky-testnet test paths.
 
 ## Quick local run
 

@@ -45,7 +45,7 @@ TURN sees both public endpoints, allocation timing, and byte counts, but only fo
 
 ## Denial of service
 
-No NAT traversal system can guarantee a direct connection. Symmetric NAT, UDP blocking, endpoint-dependent filtering, or enterprise policy may require TURN; some networks block that too. The API exposes timeouts and explicit failure.
+No NAT traversal system can guarantee a direct connection. Symmetric NAT, endpoint-dependent filtering, or enterprise policy may require TURN; some networks block that too. The v1 native client reaches TURN over UDP, so a network that blocks all UDP produces a bounded failure (browser implementations may use TCP/TLS TURN). The API exposes timeouts and explicit failure.
 
 The in-memory v1 rendezvous is not by itself a complete DDoS perimeter. Production deployments should add:
 

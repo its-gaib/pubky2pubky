@@ -9,6 +9,9 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 cargo audit
+npm ci --ignore-scripts
+npm run lint:schemas
+shellcheck scripts/*.sh
 ```
 
 Install the audit command once with `cargo install cargo-audit --locked`. CI also runs the same RustSec scan on every change.
@@ -51,10 +54,21 @@ With the Pubky development stack running, create an identity, sign it up against
 The real direct test uses independent UDP sockets but a shared host. For release testing, put each CLI process behind a different Linux network namespace, VM, or physical network. Confirm:
 
 1. direct mode reports `Direct` under endpoint-independent NAT;
-2. port-dependent/symmetric NAT selects `Relayed`;
-3. blocking UDP forces TURN/TCP where configured;
+2. port-dependent/symmetric NAT selects UDP `Relayed` when TURN is reachable;
+3. blocking all UDP returns a bounded error in the current native client;
 4. disabling TURN under an impossible NAT returns a bounded error;
 5. the rendezvous packet capture contains only signed control metadata and HPKE ciphertext;
 6. no inbound port is opened on either client network.
 
-The CI suite avoids assuming privileged namespace or Docker access; the ignored test and deployment smoke script cover those infrastructure-dependent paths.
+The hosted Linux CI job runs the ignored real-coturn test and the privileged two-namespace NAT lab after the default suite. The deployment smoke script remains available for an end-to-end Compose health check.
+
+On Linux, `scripts/nat-lab.sh` automates the direct-path case with two device namespaces, two independent gateway namespaces, isolated private subnets, port-preserving address translation, and stateful inbound firewalls. This intentionally models endpoint-independent NAT, where UDP hole punching should succeed; the separate TURN-only test covers relay behavior. Start the rendezvous/STUN/TURN deployment first, build the CLI, then run:
+
+```bash
+cargo build --release -p hole-punchky
+sudo HPK_RENDEZVOUS_CONNECT_IP=192.0.2.10 \
+  HPK_RENDEZVOUS_CONNECT_PORT=8080 \
+  scripts/nat-lab.sh
+```
+
+Use the address of the host-side rendezvous service as `HPK_RENDEZVOUS_CONNECT_IP`. The script requires IPv4 forwarding plus `ip`, `iptables`, `tc`, `flock`, and `timeout`; it fails unless both peers report `Direct` and the echoed bytes match. Its namespaces, routes, firewall/translation rules, identities, and logs are removed on exit.

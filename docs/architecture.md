@@ -35,11 +35,13 @@ WebRTC already supplies the difficult, interoperable pieces:
 
 - ICE candidate gathering, prioritization, connectivity checks, and nomination.
 - UDP hole punching with host and server-reflexive candidates.
-- TURN fallback for symmetric NAT, carrier-grade NAT, UDP blocking, and strict firewalls.
+- TURN fallback for symmetric NAT, carrier-grade NAT, and strict firewalls when UDP can reach the relay.
 - DTLS peer transport authentication and encryption.
 - SCTP reliable, ordered DataChannels with browser compatibility.
 
 The application-level Pubky signatures bind the WebRTC offer and answer to the intended identities. DTLS then protects the established packet path. The native client gathers candidates before sending its encrypted offer/answer (non-trickle ICE); the wire protocol also defines encrypted candidate frames so browser or future native clients may trickle.
+
+The current native WebRTC dependency implements TURN over UDP only. Browser clients can use the advertised TCP/TLS alternatives, but native TCP/TLS relay fallback requires upstream transport support or a separate implementation; blocking all UDP currently produces a bounded negotiation error.
 
 ## When an upstream homeserver change could help
 

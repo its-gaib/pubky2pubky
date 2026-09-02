@@ -241,7 +241,10 @@ async fn forced_turn_path_relays_data_channel() {
     let relay_config = RendezvousClientConfig {
         negotiation_timeout: Duration::from_secs(45),
         ice_gather_timeout: Duration::from_secs(25),
-        udp_bind_addresses: vec!["0.0.0.0:0".to_owned()],
+        // This is deliberately a same-host coturn test. Pinning loopback avoids
+        // creating unusable allocations from every Docker/VM bridge address on
+        // development and CI hosts.
+        udp_bind_addresses: vec!["127.0.0.1:0".to_owned()],
         request_turn: true,
         ..RendezvousClientConfig::default()
     };

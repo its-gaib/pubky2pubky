@@ -26,6 +26,7 @@ use url::Url;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const CLOSE_MARKER: &[u8] = b"__hole_punchky_close__";
+const CLOSE_ACK: &[u8] = b"__hole_punchky_close_ack__";
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -396,6 +397,8 @@ async fn listen(args: ListenArgs) -> Result<()> {
                 loop {
                     let bytes = peer.recv().await?;
                     if bytes == CLOSE_MARKER {
+                        peer.send(CLOSE_ACK).await?;
+                        peer.flush(Duration::from_secs(5)).await?;
                         break;
                     }
                     peer.send(&bytes).await?;
@@ -448,6 +451,13 @@ async fn dial(args: DialArgs) -> Result<()> {
             .context("timed out waiting for response")??;
         println!("response={}", String::from_utf8_lossy(&response));
         peer.send(CLOSE_MARKER).await?;
+        let acknowledgement = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+            .await
+            .context("timed out waiting for close acknowledgement")??;
+        if acknowledgement != CLOSE_ACK {
+            bail!("peer returned an invalid close acknowledgement");
+        }
+        peer.flush(Duration::from_secs(5)).await?;
     }
     peer.close().await?;
     Ok(())

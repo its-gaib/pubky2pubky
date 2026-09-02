@@ -6,7 +6,7 @@ services:
     restart: unless-stopped
     environment:
       HPK_BIND: 0.0.0.0:8080
-      HPK_STUN_URLS: stun:${HPK_PUBLIC_HOST:-127.0.0.1}:3478
+      HPK_STUN_URLS: stun:${HPK_PUBLIC_HOST:-127.0.0.1}:3479
       HPK_TURN_URLS: turn:${HPK_PUBLIC_HOST:-127.0.0.1}:3478?transport=udp,turn:${HPK_PUBLIC_HOST:-127.0.0.1}:3478?transport=tcp
       HPK_TURN_SHARED_SECRET: ${HPK_TURN_SHARED_SECRET:?set HPK_TURN_SHARED_SECRET to a random value}
       HPK_ALLOWED_ORIGINS: ${HPK_ALLOWED_ORIGINS:-}
@@ -24,6 +24,8 @@ services:
       retries: 10
     depends_on:
       coturn:
+        condition: service_healthy
+      stun:
         condition: service_healthy
 
   coturn:
@@ -49,6 +51,27 @@ services:
       - "49160-49200:49160-49200/udp"
     healthcheck:
       test: ["CMD", "turnutils_stunclient", "127.0.0.1", "-p", "3478"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  stun:
+    image: coturn/coturn:4.6.3-r3-alpine@sha256:e2bca2f79a4269d7240de5872ab60a9305013ad37296d2acf14f9510874346be
+    restart: unless-stopped
+    command:
+      - --no-cli
+      - --log-file=stdout
+      - --listening-port=3479
+      - --fingerprint
+      - --no-multicast-peers
+      - --stun-only
+      - --external-ip=${HPK_PUBLIC_IP:-127.0.0.1}
+      - --no-tls
+      - --no-dtls
+    ports:
+      - "3479:3479/udp"
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -lnu | grep -q ':3479 '"]
       interval: 5s
       timeout: 3s
       retries: 10

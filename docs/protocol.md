@@ -137,7 +137,7 @@ After a session is accepted, either bound peer may send a signed `request_turn_c
 
 The credential is `base64(HMAC-SHA1(static-auth-secret, username))`. Default validity is five minutes. The response includes the session id to disambiguate concurrent negotiations.
 
-TURN-only ICE is a privacy mode. Normal ICE includes host, server-reflexive, and relay candidates; it prefers a direct pair and automatically falls back to TURN.
+TURN-only ICE is a privacy mode. Normal ICE includes host, server-reflexive, and relay candidates; it prefers a direct pair and automatically falls back to TURN. The reference native client supports UDP TURN in v1 and ignores TCP/TLS TURN URLs; those transports remain usable by browser implementations and reserved for future native support.
 
 ## Server errors
 

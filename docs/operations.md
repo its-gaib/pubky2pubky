@@ -3,7 +3,7 @@
 ## Public deployment checklist
 
 1. Give the rendezvous endpoint a DNS name and terminate TLS so clients use `wss://`.
-2. Give coturn a stable public IP. Open UDP/TCP 3478 and the configured UDP relay range 49160–49200.
+2. Give coturn a stable public IP. Open UDP/TCP 3478, UDP 3479, and the configured UDP relay range 49160–49200.
 3. Copy `deploy/.env.example` to `.env`, set the public host/IP, and generate a 32-byte random TURN shared secret.
 4. Put the same secret in rendezvous and coturn. Never place it in Pubky storage.
 5. Configure `HPK_ALLOWED_ORIGINS` for browser clients. Native clients normally send no Origin.
@@ -11,7 +11,9 @@
 7. Verify `/healthz`, `/v1/config`, `/metrics`, a direct test, and a forced TURN-only test from different networks.
 8. Publish a root-signed descriptor containing the public `wss://.../v1/ws` URL.
 
-The example compose file disables TURN TLS because WebRTC payloads are already protected by DTLS and UDP TURN is the normal path. If TCP fallback must blend with HTTPS policy, configure coturn certificates and `turns:` on TCP 5349. WSS for rendezvous is mandatory on the public internet.
+The example compose file disables TURN TLS because WebRTC payloads are already protected by DTLS and UDP TURN is the normal path. Browser clients can use TCP fallback when coturn is configured with certificates and `turns:` on TCP 5349. The current native client supports UDP TURN only, so TCP/TLS relay requires upstream transport support or a separate implementation. WSS for rendezvous is mandatory on the public internet.
+
+The native client currently requires STUN and TURN to use distinct server socket addresses. The example runs a STUN-only coturn process on UDP 3479 and the authenticated TURN process on 3478. They reuse the same image but share neither state nor the TURN secret. Preserve that separation until the upstream WebRTC transport can demultiplex Binding responses from a colocated TURN transaction by message type.
 
 ## Reverse proxy
 
@@ -57,7 +59,8 @@ Co-location is operational, not protocol coupling. The sidecar does not need hom
 443/tcp  reverse proxy
   /v1/ws          -> hole-punchky-rendezvous:8080
   homeserver host -> pubky-homeserver
-3478/udp+tcp      -> coturn
+3478/udp+tcp      -> coturn TURN
+3479/udp          -> coturn STUN
 49160-49200/udp   -> coturn allocations
 ```
 

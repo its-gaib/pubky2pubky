@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -197,12 +200,37 @@ impl Peer {
     /// # Errors
     ///
     /// Returns an error when either the data channel or peer connection cannot close cleanly.
+    /// Call [`Self::flush`] first when queued application bytes must be acknowledged before
+    /// teardown.
     pub async fn close(&self) -> Result<()> {
         let channel_result = self.data_channel.close().await;
         let peer_result = self.connection.close().await;
         channel_result
             .and(peer_result)
             .map_err(|error| ClientError::WebRtc(error.to_string()))
+    }
+
+    /// Wait until SCTP has acknowledged or abandoned all queued outbound bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the data channel fails or the supplied timeout elapses.
+    pub async fn flush(&self, timeout: Duration) -> Result<()> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let outstanding = self
+                    .data_channel
+                    .outstanding_bytes()
+                    .await
+                    .map_err(|error| ClientError::WebRtc(error.to_string()))?;
+                if outstanding == 0 {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| ClientError::Timeout("draining peer data channel"))?
     }
 }
 
@@ -396,10 +424,11 @@ impl RendezvousClient {
         )?;
         self.send(ClientFrame::Accept(accept)).await?;
 
-        let turn = self
-            .turn_for_session(knock.session_id, ice_policy, &mut events)
-            .await?;
-        let mut built = Box::pin(build_peer_connection(self, ice_policy, turn.as_ref())).await?;
+        // Capture the initiator's offer before requesting TURN credentials. Both
+        // messages arrive on the same event stream, and the offer can race ahead
+        // of the credential response when the two peers use separate network
+        // paths. Waiting for it first also avoids allocating relay resources for
+        // a session whose initiator never follows through after consent.
         let offer = wait_for_description(
             self,
             &mut events,
@@ -408,6 +437,10 @@ impl RendezvousClient {
             "offer",
         )
         .await?;
+        let turn = self
+            .turn_for_session(knock.session_id, ice_policy, &mut events)
+            .await?;
+        let mut built = Box::pin(build_peer_connection(self, ice_policy, turn.as_ref())).await?;
         built
             .connection
             .set_remote_description(offer)

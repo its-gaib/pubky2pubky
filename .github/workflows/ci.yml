@@ -9,6 +9,14 @@ permissions:
   contents: read
 
 jobs:
+  specifications:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: npm ci --ignore-scripts
+      - run: npm run lint:schemas
+
   security:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -30,9 +38,15 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: shellcheck scripts/*.sh
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --all-targets
+      - name: Discover runner address
+        run: |
+          runner_ip=$(ip -4 route get 1.1.1.1 | sed -n 's/.* src \([^ ]*\).*/\1/p' | head -n 1)
+          test -n "$runner_ip"
+          echo "HPK_RUNNER_IP=$runner_ip" >> "$GITHUB_ENV"
       - name: Start coturn for forced-relay test
         run: |
           # Both test peers share this runner; never enable this on an Internet-facing TURN server.
@@ -42,6 +56,8 @@ jobs:
             --allow-loopback-peers \
             --use-auth-secret --static-auth-secret=hole-punchky-ci-secret \
             --realm=hole-punchky.test --listening-port=3478 \
+            --listening-ip=127.0.0.1 --relay-ip=127.0.0.1 \
+            --external-ip=127.0.0.1 \
             --min-port=49160 --max-port=49200
           for attempt in {1..20}; do
             if docker exec hole-punchky-ci-turn \
@@ -57,12 +73,48 @@ jobs:
           HPK_TEST_TURN_URL: turn:127.0.0.1:3478?transport=udp
           HPK_TEST_TURN_SECRET: hole-punchky-ci-secret
         run: cargo test -p hole-punchky-client --test e2e forced_turn_path_relays_data_channel -- --ignored
-      - name: Show coturn logs on failure
+      - name: Start STUN and rendezvous for two-NAT test
+        run: |
+          docker run --detach --name hole-punchky-ci-stun --network host \
+            coturn/coturn:4.6.3-r3-alpine@sha256:e2bca2f79a4269d7240de5872ab60a9305013ad37296d2acf14f9510874346be \
+            --no-cli --log-file=stdout --fingerprint --no-multicast-peers \
+            --stun-only --listening-port=3479 --external-ip="$HPK_RUNNER_IP" \
+            --no-tls --no-dtls
+          cargo build -p hole-punchky
+          target/debug/hole-punchky serve --bind 0.0.0.0:18080 \
+            --stun "stun:$HPK_RUNNER_IP:3479" \
+            >/tmp/hole-punchky-ci-rendezvous.log 2>&1 &
+          echo "$!" >/tmp/hole-punchky-ci-rendezvous.pid
+          for attempt in {1..20}; do
+            if curl --fail --silent http://127.0.0.1:18080/healthz; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/hole-punchky-ci-rendezvous.log
+          exit 1
+      - name: Test direct traversal across two NATs
+        run: |
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo env \
+            HPK_BIN="$GITHUB_WORKSPACE/target/debug/hole-punchky" \
+            HPK_RENDEZVOUS_CONNECT_IP="$HPK_RUNNER_IP" \
+            HPK_RENDEZVOUS_CONNECT_PORT=18080 \
+            "$GITHUB_WORKSPACE/scripts/nat-lab.sh"
+      - name: Show infrastructure logs on failure
         if: failure()
-        run: docker logs hole-punchky-ci-turn 2>/dev/null || true
-      - name: Stop coturn
+        run: |
+          docker logs hole-punchky-ci-turn 2>/dev/null || true
+          docker logs hole-punchky-ci-stun 2>/dev/null || true
+          cat /tmp/hole-punchky-ci-rendezvous.log 2>/dev/null || true
+      - name: Stop test infrastructure
         if: always()
-        run: docker rm --force hole-punchky-ci-turn 2>/dev/null || true
+        run: |
+          if test -f /tmp/hole-punchky-ci-rendezvous.pid; then
+            kill "$(cat /tmp/hole-punchky-ci-rendezvous.pid)" 2>/dev/null || true
+          fi
+          docker rm --force hole-punchky-ci-stun 2>/dev/null || true
+          docker rm --force hole-punchky-ci-turn 2>/dev/null || true
 
   container:
     runs-on: ubuntu-latest
@@ -70,6 +122,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Validate Compose configuration
+        env:
+          HPK_TURN_SHARED_SECRET: compose-validation-only
+        run: docker compose -f deploy/docker-compose.yml config --quiet
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .

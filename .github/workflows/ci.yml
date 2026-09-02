@@ -12,6 +12,9 @@ jobs:
   security:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
@@ -32,9 +35,11 @@ jobs:
       - run: cargo test --workspace --all-targets
       - name: Start coturn for forced-relay test
         run: |
+          # Both test peers share this runner; never enable this on an Internet-facing TURN server.
           docker run --detach --name hole-punchky-ci-turn --network host \
             coturn/coturn:4.6.3-r3-alpine@sha256:e2bca2f79a4269d7240de5872ab60a9305013ad37296d2acf14f9510874346be \
             --no-cli --log-file=stdout --fingerprint --no-multicast-peers \
+            --allow-loopback-peers \
             --use-auth-secret --static-auth-secret=hole-punchky-ci-secret \
             --realm=hole-punchky.test --listening-port=3478 \
             --min-port=49160 --max-port=49200

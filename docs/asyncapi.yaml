@@ -1,0 +1,143 @@
+asyncapi: 3.1.0
+info:
+  title: Hole Punchky rendezvous WebSocket
+  version: 1.0.0
+  description: >-
+    Consent-first, authenticated routing for end-to-end encrypted WebRTC signaling.
+    Cryptographic construction and state ordering are normative in protocol.md.
+  license:
+    name: MIT
+    url: https://opensource.org/license/mit
+servers:
+  production:
+    host: connect.example.com
+    pathname: /v1/ws
+    protocol: wss
+channels:
+  rendezvous:
+    address: /v1/ws
+    messages:
+      clientFrame: { $ref: "#/components/messages/ClientFrame" }
+      serverFrame: { $ref: "#/components/messages/ServerFrame" }
+operations:
+  sendClientFrame:
+    action: send
+    channel: { $ref: "#/channels/rendezvous" }
+    messages:
+      - { $ref: "#/channels/rendezvous/messages/clientFrame" }
+  receiveServerFrame:
+    action: receive
+    channel: { $ref: "#/channels/rendezvous" }
+    messages:
+      - { $ref: "#/channels/rendezvous/messages/serverFrame" }
+components:
+  messages:
+    ClientFrame:
+      payload:
+        $ref: "#/components/schemas/ClientFrame"
+    ServerFrame:
+      payload:
+        $ref: "#/components/schemas/ServerFrame"
+  schemas:
+    ClientFrame:
+      oneOf:
+        - $ref: "#/components/schemas/RegisterFrame"
+        - $ref: "#/components/schemas/KnockFrame"
+        - $ref: "#/components/schemas/AcceptFrame"
+        - $ref: "#/components/schemas/RejectFrame"
+        - $ref: "#/components/schemas/SignalFrame"
+        - $ref: "#/components/schemas/TurnRequestFrame"
+        - type: object
+          required: [type, data]
+          properties:
+            type: { const: ping }
+            data:
+              type: object
+              required: [nonce]
+              properties: { nonce: { type: string, maxLength: 256 } }
+    ServerFrame:
+      type: object
+      required: [type, data]
+      properties:
+        type:
+          enum: [registered, knock, accepted, rejected, signal, turn_credentials, pong, error]
+        data: { type: object }
+    RegisterFrame:
+      $ref: "#/components/schemas/AuthenticatedFrame"
+      description: type is register; payload signing domain is hole-punchky/register/v1.
+    KnockFrame:
+      $ref: "#/components/schemas/AuthenticatedFrame"
+      description: type is knock; payload signing domain is hole-punchky/knock/v1.
+    AcceptFrame:
+      $ref: "#/components/schemas/AuthenticatedFrame"
+      description: type is accept; payload signing domain is hole-punchky/accept/v1.
+    RejectFrame:
+      $ref: "#/components/schemas/AuthenticatedFrame"
+      description: type is reject; payload signing domain is hole-punchky/reject/v1.
+    TurnRequestFrame:
+      $ref: "#/components/schemas/AuthenticatedFrame"
+      description: type is request_turn_credentials; payload domain is hole-punchky/turn-request/v1.
+    AuthenticatedFrame:
+      type: object
+      required: [type, data]
+      properties:
+        type: { type: string }
+        data:
+          type: object
+          required: [payload, certificate, signature]
+          properties:
+            payload: { type: object }
+            certificate: { $ref: "#/components/schemas/DeviceCertificate" }
+            signature: { $ref: "#/components/schemas/Base64Url" }
+    DeviceCertificate:
+      type: object
+      required: [claims, signature]
+      properties:
+        claims:
+          type: object
+          required: [version, identity, device_id, signing_key, encryption_key, issued_at, expires_at, capabilities]
+          properties:
+            version: { const: 1 }
+            identity: { $ref: "#/components/schemas/PubkyIdentity" }
+            device_id: { type: string, minLength: 1, maxLength: 128 }
+            signing_key: { $ref: "#/components/schemas/PubkyIdentity" }
+            encryption_key: { $ref: "#/components/schemas/Base64Url" }
+            issued_at: { type: integer, minimum: 0 }
+            expires_at: { type: integer, minimum: 1 }
+            capabilities:
+              type: array
+              items: { type: string }
+        signature: { $ref: "#/components/schemas/Base64Url" }
+    SignalFrame:
+      type: object
+      required: [type, data]
+      properties:
+        type: { const: signal }
+        data:
+          type: object
+          required: [header, certificate, encapsulated_key, ciphertext, signature]
+          properties:
+            header:
+              type: object
+              required: [version, session_id, from_identity, from_device_id, to_identity, to_device_id, sequence, kind, issued_at, expires_at]
+              properties:
+                version: { const: 1 }
+                session_id: { type: string, format: uuid }
+                from_identity: { $ref: "#/components/schemas/PubkyIdentity" }
+                from_device_id: { type: string }
+                to_identity: { $ref: "#/components/schemas/PubkyIdentity" }
+                to_device_id: { type: string }
+                sequence: { type: integer, minimum: 0 }
+                kind: { enum: [offer, answer, candidate, end_of_candidates, abort] }
+                issued_at: { type: integer, minimum: 0 }
+                expires_at: { type: integer, minimum: 1 }
+            certificate: { $ref: "#/components/schemas/DeviceCertificate" }
+            encapsulated_key: { $ref: "#/components/schemas/Base64Url" }
+            ciphertext: { $ref: "#/components/schemas/Base64Url" }
+            signature: { $ref: "#/components/schemas/Base64Url" }
+    PubkyIdentity:
+      type: string
+      pattern: "^[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$"
+    Base64Url:
+      type: string
+      pattern: "^[A-Za-z0-9_-]+$"

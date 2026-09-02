@@ -1,0 +1,68 @@
+openapi: 3.1.0
+info:
+  title: Hole Punchky rendezvous HTTP surface
+  version: 1.0.0
+  description: The signaling protocol on /v1/ws is specified in asyncapi.yaml.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: https://rendezvous.invalid
+    description: Replace with the rendezvous deployment's public origin.
+security: []
+paths:
+  /healthz:
+    get:
+      summary: Check rendezvous process health
+      operationId: health
+      responses:
+        "200":
+          description: Process is serving.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, protocol_version]
+                properties:
+                  status: { const: ok }
+                  protocol_version: { const: 1 }
+        "405": { description: Method not allowed }
+  /v1/config:
+    get:
+      summary: Read public ICE and protocol configuration
+      operationId: publicConfig
+      responses:
+        "200":
+          description: Non-secret client and limit information.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [protocol_version, stun_urls, turn_available, session_ttl_seconds, max_message_bytes]
+                properties:
+                  protocol_version: { const: 1 }
+                  stun_urls:
+                    type: array
+                    items: { type: string }
+                  turn_available: { type: boolean }
+                  session_ttl_seconds: { type: integer, minimum: 1 }
+                  max_message_bytes: { type: integer, minimum: 1024 }
+        "405": { description: Method not allowed }
+  /metrics:
+    get:
+      summary: Read Prometheus metrics
+      operationId: prometheusMetrics
+      responses:
+        "200":
+          description: Prometheus 0.0.4 text exposition.
+          content:
+            text/plain:
+              schema: { type: string }
+        "405": { description: Method not allowed }
+  /v1/ws:
+    get:
+      summary: Upgrade to the signaling WebSocket protocol
+      operationId: signalingWebSocketUpgrade
+      responses:
+        "101": { description: WebSocket protocol switch }
+        "403": { description: Origin rejected by configured policy }

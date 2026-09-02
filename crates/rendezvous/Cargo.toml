@@ -1,0 +1,33 @@
+[package]
+name = "hole-punchky-rendezvous"
+description = "Consent-first rendezvous service for Hole Punchky"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+hmac.workspace = true
+hole-punchky-protocol = { path = "../protocol" }
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+pubky.workspace = true
+reqwest.workspace = true
+tokio-tungstenite.workspace = true
+
+[lints]
+workspace = true

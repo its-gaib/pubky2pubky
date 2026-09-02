@@ -1,0 +1,3 @@
+connect.example.com {
+    reverse_proxy rendezvous:8080
+}

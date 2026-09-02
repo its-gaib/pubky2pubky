@@ -1,0 +1,54 @@
+services:
+  rendezvous:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    environment:
+      HPK_BIND: 0.0.0.0:8080
+      HPK_STUN_URLS: stun:${HPK_PUBLIC_HOST:-127.0.0.1}:3478
+      HPK_TURN_URLS: turn:${HPK_PUBLIC_HOST:-127.0.0.1}:3478?transport=udp,turn:${HPK_PUBLIC_HOST:-127.0.0.1}:3478?transport=tcp
+      HPK_TURN_SHARED_SECRET: ${HPK_TURN_SHARED_SECRET:?set HPK_TURN_SHARED_SECRET to a random value}
+      HPK_ALLOWED_ORIGINS: ${HPK_ALLOWED_ORIGINS:-}
+      HPK_MAX_SESSIONS: ${HPK_MAX_SESSIONS:-10000}
+      HPK_MAX_CONNECTIONS_PER_IDENTITY: ${HPK_MAX_CONNECTIONS_PER_IDENTITY:-16}
+      HPK_MAX_CONNECTIONS: ${HPK_MAX_CONNECTIONS:-10000}
+      HPK_MAX_REGISTRATION_NONCES: ${HPK_MAX_REGISTRATION_NONCES:-50000}
+      RUST_LOG: ${RUST_LOG:-hole_punchky_rendezvous=info,tower_http=info}
+    ports:
+      - "${HPK_RENDEZVOUS_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      coturn:
+        condition: service_healthy
+
+  coturn:
+    image: coturn/coturn:4.6.3-r3-alpine@sha256:e2bca2f79a4269d7240de5872ab60a9305013ad37296d2acf14f9510874346be
+    restart: unless-stopped
+    command:
+      - --no-cli
+      - --log-file=stdout
+      - --listening-port=3478
+      - --min-port=49160
+      - --max-port=49200
+      - --fingerprint
+      - --no-multicast-peers
+      - --use-auth-secret
+      - --static-auth-secret=${HPK_TURN_SHARED_SECRET:?set HPK_TURN_SHARED_SECRET to a random value}
+      - --realm=${HPK_TURN_REALM:-hole-punchky.local}
+      - --external-ip=${HPK_PUBLIC_IP:-127.0.0.1}
+      - --no-tls
+      - --no-dtls
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "49160-49200:49160-49200/udp"
+    healthcheck:
+      test: ["CMD", "turnutils_stunclient", "127.0.0.1", "-p", "3478"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

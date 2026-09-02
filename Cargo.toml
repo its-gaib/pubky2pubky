@@ -1,0 +1,54 @@
+[workspace]
+members = [
+    "crates/client",
+    "crates/cli",
+    "crates/protocol",
+    "crates/rendezvous",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/its-gaib/hole-punchky"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive", "env"] }
+ed25519-dalek = "3.0"
+futures-util = "0.3"
+hmac = "0.12"
+hpke = { version = "0.14", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
+pubky = { version = "0.11", features = ["json"] }
+pubky-common = "0.11"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_jcs = "0.2"
+serde_json = "1.0"
+sha1 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["catch-panic", "cors", "limit", "request-id", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = { version = "2.5", features = ["serde"] }
+uuid = { version = "1.18", features = ["serde", "v4"] }
+webrtc = "0.20"
+zeroize = { version = "1.8", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"

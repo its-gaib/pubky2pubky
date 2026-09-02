@@ -1,0 +1,30 @@
+[package]
+name = "hole-punchky-client"
+description = "Native Hole Punchky client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes = "1.10"
+futures-util.workspace = true
+hole-punchky-protocol = { path = "../protocol" }
+pubky.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+webrtc.workspace = true
+
+[dev-dependencies]
+hole-punchky-rendezvous = { path = "../rendezvous" }
+
+[lints]
+workspace = true

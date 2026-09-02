@@ -1,0 +1,6 @@
+extends:
+  - recommended
+
+rules:
+  # /v1/ws upgrades with 101 Switching Protocols; it has no successful 2xx response.
+  operation-2xx-response: off

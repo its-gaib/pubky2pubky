@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM rust:1.91-bookworm@sha256:c1e5f19e773b7878c3f7a805dd00a495e747acbdc76fb2337a4ebf0418896b33 AS builder
+FROM rust:1.98-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential cmake pkg-config \

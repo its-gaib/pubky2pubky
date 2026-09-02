@@ -26,8 +26,10 @@ The default suite covers:
 Run coturn with the same REST secret used by the ephemeral test server, then execute the ignored integration test:
 
 ```bash
-docker run --rm --network host coturn/coturn:4.6.3-r3-alpine \
+docker run --rm --network host \
+  coturn/coturn:4.6.3-r3-alpine@sha256:e2bca2f79a4269d7240de5872ab60a9305013ad37296d2acf14f9510874346be \
   --no-cli --log-file=stdout --fingerprint --use-auth-secret \
+  --allow-loopback-peers \
   --static-auth-secret=hole-punchky-integration-secret \
   --realm=hole-punchky.test --listening-port=3478 \
   --min-port=49160 --max-port=49200
@@ -38,6 +40,7 @@ cargo test -p hole-punchky-client forced_turn_path_relays_data_channel -- --igno
 ```
 
 The test sets ICE policy to `RelayOnly`, exchanges application bytes, and requires both peers' nominated local candidate stats to report `Relayed`.
+`--allow-loopback-peers` is required only because coturn and both test peers share one host. Never enable it on an Internet-facing TURN server.
 
 ## Pubky testnet path
 

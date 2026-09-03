@@ -8,9 +8,10 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 cargo audit
+npm ci --ignore-scripts
+npm run lint:schemas
+shellcheck scripts/*.sh
 
-if [[ "${HPK_TEST_TURN:-0}" == "1" ]]; then
-  : "${HPK_TEST_TURN_URL:?set HPK_TEST_TURN_URL}"
-  : "${HPK_TEST_TURN_SECRET:?set HPK_TEST_TURN_SECRET}"
-  cargo test -p hole-punchky-client forced_turn_path_relays_data_channel -- --ignored --nocapture
+if [[ "${HPK_TEST_CONTAINERS:-0}" == "1" ]]; then
+  "$repo_dir/scripts/container-smoke.sh"
 fi

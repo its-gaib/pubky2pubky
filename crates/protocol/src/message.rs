@@ -3,19 +3,6 @@ use uuid::Uuid;
 
 use crate::{Authenticated, SignedPayload};
 
-/// ICE server configuration supplied by the rendezvous service.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IceServer {
-    /// STUN or TURN URLs.
-    pub urls: Vec<String>,
-    /// Optional TURN username.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub username: Option<String>,
-    /// Optional TURN credential.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credential: Option<String>,
-}
-
 macro_rules! impl_signed_payload {
     ($type:ty, $domain:literal) => {
         impl SignedPayload for $type {
@@ -56,7 +43,7 @@ pub struct Registration {
     /// End of message validity.
     pub expires_at: u64,
 }
-impl_signed_payload!(Registration, "hole-punchky/register/v1");
+impl_signed_payload!(Registration, "hole-punchky/register/v2");
 
 /// Ask an identity's online devices for permission to negotiate a connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +61,7 @@ pub struct Knock {
     /// Optional exact target device; otherwise every online device receives the knock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_device_id: Option<String>,
-    /// Application protocol requested over the data channel.
+    /// Application protocol requested over the resulting QUIC stream.
     pub application: String,
     /// Opaque, non-secret caller metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,7 +71,7 @@ pub struct Knock {
     /// End of message validity.
     pub expires_at: u64,
 }
-impl_signed_payload!(Knock, "hole-punchky/knock/v1");
+impl_signed_payload!(Knock, "hole-punchky/knock/v2");
 
 /// Accept a pending knock and bind the session to this device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,7 +91,7 @@ pub struct Accept {
     /// End of message validity.
     pub expires_at: u64,
 }
-impl_signed_payload!(Accept, "hole-punchky/accept/v1");
+impl_signed_payload!(Accept, "hole-punchky/accept/v2");
 
 /// Decline a pending knock.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,40 +113,7 @@ pub struct Reject {
     /// End of message validity.
     pub expires_at: u64,
 }
-impl_signed_payload!(Reject, "hole-punchky/reject/v1");
-
-/// Ask for session-scoped, short-lived TURN REST credentials.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TurnRequest {
-    /// Protocol version.
-    pub version: u16,
-    /// Requesting Pubky identity.
-    pub identity: String,
-    /// Requesting device id.
-    pub device_id: String,
-    /// Accepted session requiring relay service.
-    pub session_id: Uuid,
-    /// Beginning of message validity.
-    pub issued_at: u64,
-    /// End of message validity.
-    pub expires_at: u64,
-}
-impl_signed_payload!(TurnRequest, "hole-punchky/turn-request/v1");
-
-/// A short-lived TURN credential following coturn's REST convention.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TurnCredentials {
-    /// Accepted rendezvous session these credentials were minted for.
-    pub session_id: Uuid,
-    /// TURN URLs usable with this credential.
-    pub urls: Vec<String>,
-    /// Time-qualified TURN username.
-    pub username: String,
-    /// HMAC-derived password.
-    pub credential: String,
-    /// Credential expiry in Unix seconds.
-    pub expires_at: u64,
-}
+impl_signed_payload!(Reject, "hole-punchky/reject/v2");
 
 /// Stable machine-readable server errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,8 +133,6 @@ pub enum ErrorCode {
     RateLimited,
     /// A message exceeds the configured bound.
     TooLarge,
-    /// TURN fallback is not configured.
-    TurnUnavailable,
     /// Unexpected internal failure.
     Internal,
 }
@@ -197,10 +149,8 @@ pub enum ClientFrame {
     Accept(Authenticated<Accept>),
     /// Decline a pending session.
     Reject(Authenticated<Reject>),
-    /// Forward opaque encrypted WebRTC signaling.
+    /// Forward an opaque encrypted responder endpoint or abort signal.
     Signal(crate::EncryptedSignal),
-    /// Obtain a relay credential after consent.
-    RequestTurnCredentials(Authenticated<TurnRequest>),
     /// Application heartbeat.
     Ping {
         /// Opaque value echoed by the server.
@@ -216,10 +166,10 @@ pub enum ServerFrame {
     Registered {
         /// Server-assigned connection id.
         connection_id: Uuid,
-        /// Public STUN servers safe to provide before session consent.
-        ice_servers: Vec<IceServer>,
         /// Maximum negotiated-session lifetime.
         session_ttl_seconds: u64,
+        /// Data-plane transport selected by this protocol version.
+        transport: String,
     },
     /// A caller requests a connection.
     Knock(Authenticated<Knock>),
@@ -227,10 +177,8 @@ pub enum ServerFrame {
     Accepted(Authenticated<Accept>),
     /// A target declined the session.
     Rejected(Authenticated<Reject>),
-    /// An opaque encrypted WebRTC signal from the bound peer.
+    /// An opaque encrypted iroh address or abort signal from the bound peer.
     Signal(crate::EncryptedSignal),
-    /// Short-lived relay credentials.
-    TurnCredentials(TurnCredentials),
     /// Application heartbeat response.
     Pong {
         /// Opaque value supplied by the client.

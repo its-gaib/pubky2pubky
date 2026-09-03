@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use hole_punchky_protocol::{
-    Accept, Authenticated, ClientFrame, DeviceCredential, EncryptedSignal, ErrorCode, Knock,
-    PROTOCOL_VERSION, Registration, Reject, ServerFrame, SignalPayload, TurnRequest, now_seconds,
+    Accept, Authenticated, ClientFrame, DeviceCredential, EncryptedSignal, ErrorCode,
+    IrohEndpointAddress, Knock, PROTOCOL_VERSION, Registration, Reject, ServerFrame, SignalPayload,
+    now_seconds,
 };
 use hole_punchky_rendezvous::{ServerConfig, spawn_ephemeral};
 use pubky::Keypair;
@@ -66,7 +67,7 @@ async fn connect_registered(
     address: std::net::SocketAddr,
     credential: &DeviceCredential,
 ) -> Socket {
-    let (mut socket, _) = connect_async(format!("ws://{address}/v1/ws"))
+    let (mut socket, _) = connect_async(format!("ws://{address}/v2/ws"))
         .await
         .unwrap_or_else(|error| panic!("connecting WebSocket: {error}"));
     send(
@@ -88,9 +89,7 @@ async fn connect_registered(
 )]
 async fn fans_out_binds_first_responder_and_relays_encrypted_signals() {
     let config = ServerConfig {
-        stun_urls: Vec::new(),
-        turn_urls: vec!["turn:127.0.0.1:3478?transport=udp".to_owned()],
-        turn_shared_secret: Some("integration-test-secret".to_owned()),
+        relay_auth_secret: Some("relay-to-rendezvous-test-secret".to_owned()),
         ..ServerConfig::default()
     };
     let (address, server) = spawn_ephemeral(config)
@@ -105,6 +104,43 @@ async fn fans_out_binds_first_responder_and_relays_encrypted_signals() {
     let mut alice_socket = connect_registered(address, &alice).await;
     let mut laptop_socket = connect_registered(address, &bob_laptop).await;
     let mut phone_socket = connect_registered(address, &bob_phone).await;
+
+    let auth_url = format!("http://{address}/internal/relay/authorize");
+    let authorized = reqwest::Client::new()
+        .post(&auth_url)
+        .bearer_auth("relay-to-rendezvous-test-secret")
+        .header(
+            "x-iroh-nodeid",
+            bob_laptop
+                .certificate
+                .iroh_endpoint_id_hex()
+                .unwrap_or_else(|error| panic!("endpoint id: {error}")),
+        )
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("relay authorization request: {error}"));
+    assert_eq!(authorized.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        authorized
+            .text()
+            .await
+            .unwrap_or_else(|error| panic!("authorization body: {error}")),
+        "true"
+    );
+    let denied = reqwest::Client::new()
+        .post(&auth_url)
+        .bearer_auth("wrong-secret")
+        .header(
+            "x-iroh-nodeid",
+            bob_laptop
+                .certificate
+                .iroh_endpoint_id_hex()
+                .unwrap_or_else(|error| panic!("endpoint id: {error}")),
+        )
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("denied relay authorization request: {error}"));
+    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
 
     let session_id = Uuid::new_v4();
     let now = now_seconds();
@@ -173,65 +209,52 @@ async fn fans_out_binds_first_responder_and_relays_encrypted_signals() {
         } if id == session_id
     ));
 
-    let offer_payload = SignalPayload::SessionDescription {
-        sdp_type: "offer".to_owned(),
-        sdp: "v=0\r\na=opaque-test-offer\r\n".to_owned(),
+    let endpoint_payload = SignalPayload::IrohEndpoint {
+        endpoint: IrohEndpointAddress {
+            endpoint_id: bob_laptop.iroh_endpoint_id().to_owned(),
+            relay_urls: vec![
+                "https://relay.example"
+                    .parse()
+                    .unwrap_or_else(|error| panic!("relay URL: {error}")),
+            ],
+            direct_addresses: vec![
+                "192.0.2.9:4242"
+                    .parse()
+                    .unwrap_or_else(|error| panic!("socket address: {error}")),
+            ],
+        },
     };
-    let offer = EncryptedSignal::seal(
-        &alice,
-        &bob_laptop.certificate,
+    let endpoint = EncryptedSignal::seal(
+        &bob_laptop,
+        &alice.certificate,
         session_id,
         0,
-        &offer_payload,
+        &endpoint_payload,
         now_seconds(),
         now_seconds() + 30,
     )
-    .unwrap_or_else(|error| panic!("sealing offer: {error}"));
-    send(&mut alice_socket, &ClientFrame::Signal(offer.clone())).await;
-    let ServerFrame::Signal(received) = receive(&mut laptop_socket).await else {
-        panic!("expected relayed offer");
+    .unwrap_or_else(|error| panic!("sealing endpoint address: {error}"));
+    send(&mut laptop_socket, &ClientFrame::Signal(endpoint.clone())).await;
+    let ServerFrame::Signal(received) = receive(&mut alice_socket).await else {
+        panic!("expected relayed endpoint address");
     };
     assert_eq!(
         received
-            .open(&bob_laptop, now_seconds())
-            .unwrap_or_else(|error| panic!("opening offer: {error}")),
-        offer_payload
+            .open(&alice, now_seconds())
+            .unwrap_or_else(|error| panic!("opening endpoint address: {error}")),
+        endpoint_payload
     );
 
-    // The same authenticated ciphertext cannot be replayed: its sequence has been consumed.
-    send(&mut alice_socket, &ClientFrame::Signal(offer)).await;
+    // Delivery ends the short-lived rendezvous session, so ciphertext cannot be replayed.
+    send(&mut laptop_socket, &ClientFrame::Signal(endpoint)).await;
     assert!(matches!(
-        receive(&mut alice_socket).await,
+        receive(&mut laptop_socket).await,
         ServerFrame::Error {
-            code: ErrorCode::BadRequest,
+            code: ErrorCode::SessionNotFound,
             session_id: Some(id),
             ..
         } if id == session_id
     ));
-
-    let turn = Authenticated::sign(
-        TurnRequest {
-            version: PROTOCOL_VERSION,
-            identity: alice.identity().to_owned(),
-            device_id: alice.device_id().to_owned(),
-            session_id,
-            issued_at: now_seconds(),
-            expires_at: now_seconds() + 30,
-        },
-        &alice,
-    )
-    .unwrap_or_else(|error| panic!("signing TURN request: {error}"));
-    send(
-        &mut alice_socket,
-        &ClientFrame::RequestTurnCredentials(turn),
-    )
-    .await;
-    let ServerFrame::TurnCredentials(turn) = receive(&mut alice_socket).await else {
-        panic!("expected TURN credentials");
-    };
-    assert!(turn.username.contains(alice.identity()));
-    assert!(!turn.credential.is_empty());
-    assert!(turn.expires_at > now_seconds());
 
     let health: serde_json::Value = reqwest::get(format!("http://{address}/healthz"))
         .await
@@ -443,7 +466,7 @@ async fn refuses_bad_registration_and_replayed_nonce() {
     let nonce = Uuid::new_v4().to_string();
     let valid = registration(&device, nonce);
 
-    let (mut first, _) = connect_async(format!("ws://{address}/v1/ws"))
+    let (mut first, _) = connect_async(format!("ws://{address}/v2/ws"))
         .await
         .unwrap_or_else(|error| panic!("first connection: {error}"));
     send(&mut first, &valid).await;
@@ -456,7 +479,7 @@ async fn refuses_bad_registration_and_replayed_nonce() {
         .await
         .unwrap_or_else(|error| panic!("closing first socket: {error}"));
 
-    let (mut replay, _) = connect_async(format!("ws://{address}/v1/ws"))
+    let (mut replay, _) = connect_async(format!("ws://{address}/v2/ws"))
         .await
         .unwrap_or_else(|error| panic!("replay connection: {error}"));
     send(&mut replay, &valid).await;
@@ -468,7 +491,7 @@ async fn refuses_bad_registration_and_replayed_nonce() {
         }
     ));
 
-    let (mut bad, _) = connect_async(format!("ws://{address}/v1/ws"))
+    let (mut bad, _) = connect_async(format!("ws://{address}/v2/ws"))
         .await
         .unwrap_or_else(|error| panic!("bad connection: {error}"));
     let mut tampered = registration(&device, Uuid::new_v4().to_string());
@@ -478,6 +501,34 @@ async fn refuses_bad_registration_and_replayed_nonce() {
     send(&mut bad, &tampered).await;
     assert!(matches!(
         receive(&mut bad).await,
+        ServerFrame::Error {
+            code: ErrorCode::Unauthorized,
+            ..
+        }
+    ));
+
+    let mut bound = connect_registered(address, &device).await;
+    let replacement = credential(&root, "desktop");
+    let now = now_seconds();
+    let substituted = Authenticated::sign(
+        Knock {
+            version: PROTOCOL_VERSION,
+            identity: replacement.identity().to_owned(),
+            device_id: replacement.device_id().to_owned(),
+            session_id: Uuid::new_v4(),
+            target_identity: Keypair::random().public_key().z32(),
+            target_device_id: None,
+            application: "credential-binding/1".to_owned(),
+            metadata: None,
+            issued_at: now,
+            expires_at: now + 30,
+        },
+        &replacement,
+    )
+    .unwrap_or_else(|error| panic!("signing substituted frame: {error}"));
+    send(&mut bound, &ClientFrame::Knock(substituted)).await;
+    assert!(matches!(
+        receive(&mut bound).await,
         ServerFrame::Error {
             code: ErrorCode::Unauthorized,
             ..

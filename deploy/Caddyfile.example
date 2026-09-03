@@ -1,3 +1,9 @@
 connect.example.com {
+    @internal path /internal/*
+    respond @internal 404
     reverse_proxy rendezvous:8080
+}
+
+relay.example.com {
+    reverse_proxy iroh-relay:3340
 }

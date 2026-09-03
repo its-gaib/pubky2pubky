@@ -1,8 +1,8 @@
 openapi: 3.1.0
 info:
   title: Hole Punchky rendezvous HTTP surface
-  version: 1.0.0
-  description: The signaling protocol on /v1/ws is specified in asyncapi.yaml.
+  version: 2.0.0
+  description: The signaling protocol on /v2/ws is specified in asyncapi.yaml.
   license:
     name: MIT
     identifier: MIT
@@ -25,26 +25,31 @@ paths:
                 required: [status, protocol_version]
                 properties:
                   status: { const: ok }
-                  protocol_version: { const: 1 }
+                  protocol_version: { const: 2 }
         "405": { description: Method not allowed }
-  /v1/config:
+  /v2/config:
     get:
-      summary: Read public ICE and protocol configuration
+      summary: Read public transport and protocol configuration
       operationId: publicConfig
       responses:
         "200":
-          description: Non-secret client and limit information.
+          description: Non-secret transport and limit information.
           content:
             application/json:
               schema:
                 type: object
-                required: [protocol_version, stun_urls, turn_available, session_ttl_seconds, max_message_bytes]
+                required:
+                  - protocol_version
+                  - transport
+                  - consent_required
+                  - relay_access_managed
+                  - session_ttl_seconds
+                  - max_message_bytes
                 properties:
-                  protocol_version: { const: 1 }
-                  stun_urls:
-                    type: array
-                    items: { type: string }
-                  turn_available: { type: boolean }
+                  protocol_version: { const: 2 }
+                  transport: { const: iroh-quic-v1 }
+                  consent_required: { const: true }
+                  relay_access_managed: { type: boolean }
                   session_ttl_seconds: { type: integer, minimum: 1 }
                   max_message_bytes: { type: integer, minimum: 1024 }
         "405": { description: Method not allowed }
@@ -59,10 +64,38 @@ paths:
             text/plain:
               schema: { type: string }
         "405": { description: Method not allowed }
-  /v1/ws:
+  /v2/ws:
     get:
       summary: Upgrade to the signaling WebSocket protocol
       operationId: signalingWebSocketUpgrade
       responses:
         "101": { description: WebSocket protocol switch }
         "403": { description: Origin rejected by configured policy }
+  /internal/relay/authorize:
+    post:
+      summary: Authorize an iroh endpoint currently registered over WebSocket
+      description: Internal-only callback for the official iroh relay HTTP access-control mode.
+      operationId: authorizeRelayEndpoint
+      security:
+        - relayCalloutToken: []
+      parameters:
+        - name: X-Iroh-NodeId
+          in: header
+          required: true
+          description: Header emitted by the pinned iroh-relay 1.1 binary.
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{64}$"
+      responses:
+        "200":
+          description: Endpoint is currently registered with a valid Pubky device delegation.
+          content:
+            text/plain:
+              schema: { const: "true" }
+        "403": { description: Callout authentication failed or endpoint is not registered. }
+        "404": { description: Managed relay authorization is disabled. }
+components:
+  securitySchemes:
+    relayCalloutToken:
+      type: http
+      scheme: bearer

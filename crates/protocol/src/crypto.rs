@@ -4,6 +4,8 @@ use hpke::{
     kem::X25519HkdfSha256, single_shot_open, single_shot_seal,
 };
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
+use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -15,52 +17,82 @@ use crate::{
     },
 };
 
-const SIGNAL_SIGNATURE_DOMAIN: &str = "hole-punchky/encrypted-signal/v1";
-const HPKE_INFO: &[u8] = b"hole-punchky/hpke-signal/v1";
+const SIGNAL_SIGNATURE_DOMAIN: &str = "hole-punchky/encrypted-signal/v2";
+const HPKE_INFO: &[u8] = b"hole-punchky/hpke-signal/v2";
+
+/// Maximum number of relay URLs accepted in one encrypted endpoint address.
+pub const MAX_IROH_RELAY_URLS: usize = 8;
+
+/// Maximum number of direct socket addresses accepted in one encrypted endpoint address.
+pub const MAX_IROH_DIRECT_ADDRESSES: usize = 32;
+
+/// Portable, dependency-neutral representation of an iroh endpoint address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrohEndpointAddress {
+    /// Certified iroh endpoint id in canonical z-base-32 form.
+    pub endpoint_id: String,
+    /// Relay URLs at which this endpoint is registered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_urls: Vec<Url>,
+    /// Direct addresses discovered by the endpoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub direct_addresses: Vec<SocketAddr>,
+}
+
+impl IrohEndpointAddress {
+    /// Validate field encodings and conservative resource limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a malformed id, unusable address, unsupported relay URL, or an
+    /// address list exceeding protocol limits.
+    pub fn validate(&self) -> Result<()> {
+        crate::identity::parse_public_key(&self.endpoint_id)?;
+        if self.relay_urls.len() > MAX_IROH_RELAY_URLS
+            || self.direct_addresses.len() > MAX_IROH_DIRECT_ADDRESSES
+            || (self.relay_urls.is_empty() && self.direct_addresses.is_empty())
+        {
+            return Err(ProtocolError::InvalidEncoding("iroh endpoint address"));
+        }
+        for url in &self.relay_urls {
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(ProtocolError::InvalidEncoding("iroh relay URL"));
+            }
+        }
+        if self.direct_addresses.iter().any(|address| {
+            address.port() == 0 || address.ip().is_unspecified() || address.ip().is_multicast()
+        }) {
+            return Err(ProtocolError::InvalidEncoding("iroh direct address"));
+        }
+        Ok(())
+    }
+}
 
 /// Kind of opaque payload being forwarded by the rendezvous service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SignalKind {
-    /// WebRTC SDP offer.
-    Offer,
-    /// WebRTC SDP answer.
-    Answer,
-    /// Trickle ICE candidate.
-    Candidate,
-    /// Trickle ICE gathering completed.
-    EndOfCandidates,
+    /// Responder's iroh endpoint address, released only after consent.
+    IrohEndpoint,
     /// Abort negotiation.
     Abort,
 }
 
-/// Plaintext WebRTC signal protected with recipient-specific HPKE.
+/// Plaintext negotiation signal protected with recipient-specific HPKE.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SignalPayload {
-    /// A session description.
-    SessionDescription {
-        /// SDP type (`offer` or `answer`).
-        sdp_type: String,
-        /// SDP body.
-        sdp: String,
+    /// Network coordinates for the responder's certified iroh endpoint.
+    IrohEndpoint {
+        /// Address to dial over direct UDP or the named relay.
+        endpoint: IrohEndpointAddress,
     },
-    /// One ICE candidate.
-    IceCandidate {
-        /// Candidate attribute.
-        candidate: String,
-        /// Optional SDP media id.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sdp_mid: Option<String>,
-        /// Optional SDP media-line index.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sdp_mline_index: Option<u16>,
-        /// Optional username fragment.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        username_fragment: Option<String>,
-    },
-    /// ICE gathering has no more candidates.
-    EndOfCandidates,
     /// Stop negotiation.
     Abort {
         /// Safe reason to show the peer.
@@ -71,15 +103,10 @@ pub enum SignalPayload {
 impl SignalPayload {
     fn kind(&self) -> Result<SignalKind> {
         match self {
-            Self::SessionDescription { sdp_type, .. } if sdp_type == "offer" => {
-                Ok(SignalKind::Offer)
+            Self::IrohEndpoint { endpoint } => {
+                endpoint.validate()?;
+                Ok(SignalKind::IrohEndpoint)
             }
-            Self::SessionDescription { sdp_type, .. } if sdp_type == "answer" => {
-                Ok(SignalKind::Answer)
-            }
-            Self::SessionDescription { .. } => Err(ProtocolError::InvalidEncoding("SDP type")),
-            Self::IceCandidate { .. } => Ok(SignalKind::Candidate),
-            Self::EndOfCandidates => Ok(SignalKind::EndOfCandidates),
             Self::Abort { .. } => Ok(SignalKind::Abort),
         }
     }
@@ -150,6 +177,11 @@ impl EncryptedSignal {
         expires_at: u64,
     ) -> Result<Self> {
         recipient.verify(issued_at, Some("signal"))?;
+        if let SignalPayload::IrohEndpoint { endpoint } = payload
+            && endpoint.endpoint_id != sender.iroh_endpoint_id()
+        {
+            return Err(ProtocolError::DeviceMismatch);
+        }
         let header = SignalHeader {
             version: PROTOCOL_VERSION,
             session_id,
@@ -266,6 +298,11 @@ impl EncryptedSignal {
         let payload: SignalPayload = serde_json::from_slice(&plaintext)?;
         if payload.kind()? != self.header.kind {
             return Err(ProtocolError::InvalidEncoding("signal kind"));
+        }
+        if let SignalPayload::IrohEndpoint { endpoint } = &payload
+            && endpoint.endpoint_id != self.certificate.claims.iroh_endpoint_id
+        {
+            return Err(ProtocolError::DeviceMismatch);
         }
         Ok(payload)
     }

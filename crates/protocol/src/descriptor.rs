@@ -4,14 +4,14 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::{
-    PROTOCOL_VERSION, ProtocolError, Result,
+    IROH_TRANSPORT, PROTOCOL_VERSION, ProtocolError, Result,
     identity::{canonical_for_signing, decode_signature, encode_signature, parse_public_key},
 };
 
-const DESCRIPTOR_DOMAIN: &str = "hole-punchky/rendezvous-descriptor/v1";
+const DESCRIPTOR_DOMAIN: &str = "hole-punchky/rendezvous-descriptor/v2";
 
 /// Well-known public-storage path beneath a Pubky identity.
-pub const DESCRIPTOR_PATH: &str = "/pub/hole-punchky/v1/descriptor.json";
+pub const DESCRIPTOR_PATH: &str = "/pub/hole-punchky/v2/descriptor.json";
 
 /// One public rendezvous service usable for an identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +35,8 @@ pub struct RendezvousDescriptorClaims {
     pub identity: String,
     /// Redundant rendezvous endpoints in preference order.
     pub endpoints: Vec<RendezvousEndpoint>,
+    /// Data-plane transports supported by this descriptor.
+    pub transports: Vec<String>,
     /// Unix time after which clients must re-resolve this record.
     pub expires_at: u64,
 }
@@ -66,6 +68,7 @@ impl RendezvousDescriptor {
             version: PROTOCOL_VERSION,
             identity: root.public_key().z32(),
             endpoints,
+            transports: vec![IROH_TRANSPORT.to_owned()],
             expires_at,
         };
         let signature = root.sign(&canonical_for_signing(DESCRIPTOR_DOMAIN, &claims)?);
@@ -98,6 +101,15 @@ impl RendezvousDescriptor {
         }
         if self.claims.endpoints.is_empty() || self.claims.endpoints.len() > 8 {
             return Err(ProtocolError::InvalidEncoding("rendezvous endpoint"));
+        }
+        if self.claims.transports.len() > 8
+            || !self
+                .claims
+                .transports
+                .iter()
+                .any(|transport| transport == IROH_TRANSPORT)
+        {
+            return Err(ProtocolError::InvalidEncoding("iroh transport capability"));
         }
         for endpoint in &self.claims.endpoints {
             let secure = endpoint.signaling_url.scheme() == "wss";

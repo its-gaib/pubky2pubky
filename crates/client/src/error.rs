@@ -4,7 +4,7 @@ use uuid::Uuid;
 /// Result returned by client operations.
 pub type Result<T> = std::result::Result<T, ClientError>;
 
-/// A discovery, rendezvous, or WebRTC failure.
+/// A discovery, rendezvous, or iroh transport failure.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     /// A signed or encrypted protocol object was invalid.
@@ -13,6 +13,9 @@ pub enum ClientError {
     /// The rendezvous URL violates transport policy.
     #[error("insecure or invalid rendezvous URL")]
     InvalidRendezvousUrl,
+    /// An iroh relay URL violates transport policy.
+    #[error("insecure or invalid iroh relay URL")]
+    InvalidRelayUrl,
     /// The rendezvous connection failed.
     #[error("rendezvous connection failed: {0}")]
     Rendezvous(String),
@@ -38,11 +41,11 @@ pub enum ClientError {
     /// Pubky storage or discovery failed.
     #[error("Pubky discovery failed: {0}")]
     Discovery(String),
-    /// WebRTC setup, ICE, DTLS, SCTP, or data-channel operation failed.
-    #[error("WebRTC failed: {0}")]
-    WebRtc(String),
-    /// The data channel was closed.
-    #[error("peer data channel closed")]
+    /// Iroh endpoint, relay, QUIC, or stream operation failed.
+    #[error("iroh transport failed: {0}")]
+    Iroh(String),
+    /// The authenticated peer stream was closed.
+    #[error("peer stream closed")]
     ChannelClosed,
     /// The received peer identity/session did not match the requested one.
     #[error("unexpected peer or session")]

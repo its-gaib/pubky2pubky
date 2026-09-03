@@ -9,9 +9,10 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-bytes = "1.10"
 futures-util.workspace = true
 hole-punchky-protocol = { path = "../protocol" }
+iroh.workspace = true
+n0-watcher.workspace = true
 pubky.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -21,10 +22,10 @@ tokio-tungstenite.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
-webrtc.workspace = true
 
 [dev-dependencies]
 hole-punchky-rendezvous = { path = "../rendezvous" }
+iroh-relay = { version = "=1.1.0", default-features = false, features = ["server", "tls-ring"] }
 
 [lints]
 workspace = true

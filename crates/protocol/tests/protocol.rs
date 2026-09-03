@@ -1,8 +1,9 @@
 //! Cryptographic protocol round-trip and tamper tests.
 
 use hole_punchky_protocol::{
-    Authenticated, DESCRIPTOR_PATH, DeviceCredential, EncryptedSignal, Knock, PROTOCOL_VERSION,
-    ProtocolError, RendezvousDescriptor, RendezvousEndpoint, SignalPayload,
+    Authenticated, DESCRIPTOR_PATH, DeviceCredential, EncryptedSignal, IROH_TRANSPORT,
+    IrohEndpointAddress, Knock, PROTOCOL_VERSION, ProtocolError, RendezvousDescriptor,
+    RendezvousEndpoint, SignalPayload,
 };
 use pubky_common::crypto::Keypair;
 use url::Url;
@@ -66,6 +67,13 @@ fn rejects_wrong_device_and_expired_certificate() {
         noncanonical.verify(now, None),
         Err(ProtocolError::InvalidEncoding("canonical public key"))
     ));
+
+    let mut wrong_iroh_key = credential(&root, "tablet", now).certificate.clone();
+    wrong_iroh_key.claims.iroh_endpoint_id = Keypair::random().public_key().z32();
+    assert!(matches!(
+        wrong_iroh_key.verify(now, Some("iroh")),
+        Err(ProtocolError::BadSignature)
+    ));
 }
 
 #[test]
@@ -77,11 +85,19 @@ fn hpke_signal_is_private_authenticated_and_recipient_bound() {
     let alice = credential(&alice_root, "alice-phone", now);
     let bob = credential(&bob_root, "bob-laptop", now);
     let mallory = credential(&mallory_root, "mallory", now);
-    let payload = SignalPayload::IceCandidate {
-        candidate: "candidate:secret-private-address".to_owned(),
-        sdp_mid: Some("data".to_owned()),
-        sdp_mline_index: Some(0),
-        username_fragment: None,
+    let payload = SignalPayload::IrohEndpoint {
+        endpoint: IrohEndpointAddress {
+            endpoint_id: alice.iroh_endpoint_id().to_owned(),
+            relay_urls: vec![
+                Url::parse("https://relay.example")
+                    .unwrap_or_else(|error| panic!("relay URL: {error}")),
+            ],
+            direct_addresses: vec![
+                "192.0.2.8:4242"
+                    .parse()
+                    .unwrap_or_else(|error| panic!("socket address: {error}")),
+            ],
+        },
     };
     let signal = EncryptedSignal::seal(
         &alice,
@@ -96,7 +112,8 @@ fn hpke_signal_is_private_authenticated_and_recipient_bound() {
 
     let encoded =
         serde_json::to_string(&signal).unwrap_or_else(|error| panic!("serializing: {error}"));
-    assert!(!encoded.contains("secret-private-address"));
+    assert!(!encoded.contains("192.0.2.8"));
+    assert!(!encoded.contains("relay.example"));
     assert_eq!(
         signal
             .open(&bob, now)
@@ -108,9 +125,12 @@ fn hpke_signal_is_private_authenticated_and_recipient_bound() {
         Err(ProtocolError::IdentityMismatch)
     ));
 
-    let invalid_description = SignalPayload::SessionDescription {
-        sdp_type: "pranswer".to_owned(),
-        sdp: "v=0\r\n".to_owned(),
+    let invalid_endpoint = SignalPayload::IrohEndpoint {
+        endpoint: IrohEndpointAddress {
+            endpoint_id: alice.iroh_endpoint_id().to_owned(),
+            relay_urls: Vec::new(),
+            direct_addresses: Vec::new(),
+        },
     };
     assert!(matches!(
         EncryptedSignal::seal(
@@ -118,11 +138,34 @@ fn hpke_signal_is_private_authenticated_and_recipient_bound() {
             &bob.certificate,
             Uuid::new_v4(),
             0,
-            &invalid_description,
+            &invalid_endpoint,
             now,
             now + 30,
         ),
-        Err(ProtocolError::InvalidEncoding("SDP type"))
+        Err(ProtocolError::InvalidEncoding("iroh endpoint address"))
+    ));
+
+    let wrong_endpoint = SignalPayload::IrohEndpoint {
+        endpoint: IrohEndpointAddress {
+            endpoint_id: bob.iroh_endpoint_id().to_owned(),
+            relay_urls: vec![
+                Url::parse("https://relay.example")
+                    .unwrap_or_else(|error| panic!("relay URL: {error}")),
+            ],
+            direct_addresses: Vec::new(),
+        },
+    };
+    assert!(matches!(
+        EncryptedSignal::seal(
+            &alice,
+            &bob.certificate,
+            Uuid::new_v4(),
+            0,
+            &wrong_endpoint,
+            now,
+            now + 30,
+        ),
+        Err(ProtocolError::DeviceMismatch)
     ));
 
     let mut tampered = signal;
@@ -135,7 +178,7 @@ fn hpke_signal_is_private_authenticated_and_recipient_bound() {
 
 #[test]
 fn signed_descriptor_enforces_identity_expiry_and_tls() {
-    assert_eq!(DESCRIPTOR_PATH, "/pub/hole-punchky/v1/descriptor.json");
+    assert_eq!(DESCRIPTOR_PATH, "/pub/hole-punchky/v2/descriptor.json");
     let now = 1_800_000_000;
     let root = Keypair::random();
     let descriptor = RendezvousDescriptor::sign(
@@ -154,6 +197,7 @@ fn signed_descriptor_enforces_identity_expiry_and_tls() {
             .verify(&root.public_key().z32(), now, false)
             .is_ok()
     );
+    assert_eq!(descriptor.claims.transports, vec![IROH_TRANSPORT]);
     assert!(matches!(
         descriptor.verify(&Keypair::random().public_key().z32(), now, false),
         Err(ProtocolError::IdentityMismatch)

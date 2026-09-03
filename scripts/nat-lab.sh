@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Runs the real CLI peers behind two independent Linux network namespaces and
-# stateful, endpoint-independent translating gateways. A live rendezvous/STUN
+# stateful, endpoint-independent translating gateways. A live rendezvous/iroh-relay
 # deployment must be reachable at HPK_RENDEZVOUS_CONNECT_IP.
 
 if [[ ${EUID} -ne 0 ]]; then
@@ -20,6 +20,8 @@ done
 hpk_bin=${HPK_BIN:-target/release/hole-punchky}
 connect_ip=${HPK_RENDEZVOUS_CONNECT_IP:-}
 connect_port=${HPK_RENDEZVOUS_CONNECT_PORT:-8080}
+relay_port=${HPK_IROH_RELAY_CONNECT_PORT:-3340}
+relay_ca=${HPK_IROH_RELAY_CA:-}
 
 if [[ ! -x $hpk_bin ]]; then
   printf 'Hole Punchky CLI is not executable: %s\n' "$hpk_bin" >&2
@@ -32,6 +34,18 @@ fi
 if [[ ! $connect_port =~ ^[0-9]+$ ]] || ((connect_port < 1 || connect_port > 65535)); then
   printf 'HPK_RENDEZVOUS_CONNECT_PORT must be a TCP port\n' >&2
   exit 1
+fi
+if [[ ! $relay_port =~ ^[0-9]+$ ]] || ((relay_port < 1 || relay_port > 65535)); then
+  printf 'HPK_IROH_RELAY_CONNECT_PORT must be a TCP port\n' >&2
+  exit 1
+fi
+relay_ca_args=()
+if [[ -n $relay_ca ]]; then
+  if [[ ! -r $relay_ca ]]; then
+    printf 'HPK_IROH_RELAY_CA is not readable: %s\n' "$relay_ca" >&2
+    exit 1
+  fi
+  relay_ca_args=(--iroh-relay-ca "$relay_ca")
 fi
 if [[ $(sysctl -n net.ipv4.ip_forward) != 1 ]]; then
   printf 'net.ipv4.ip_forward must be enabled in the parent namespace\n' >&2
@@ -205,10 +219,14 @@ if [[ -z $alice_identity || -z $bob_identity ]]; then
   exit 1
 fi
 
-rendezvous_url="ws://localhost:${connect_port}/v1/ws"
+rendezvous_url="ws://localhost:${connect_port}/v2/ws"
+relay_url="http://localhost:${relay_port}"
 timeout 75 ip netns exec "$device_b" "$hpk_bin" listen \
   --device "$work_dir/bob.device.json" \
   --rendezvous "$rendezvous_url" \
+  --iroh-relay "$relay_url" \
+  "${relay_ca_args[@]}" \
+  --allow-insecure-relay \
   --accept --echo --once >"$work_dir/bob.log" 2>&1 &
 bob_pid=$!
 
@@ -232,6 +250,9 @@ if ! dial_output=$(timeout 75 ip netns exec "$device_a" "$hpk_bin" dial \
   --device "$work_dir/alice.device.json" \
   --peer "$bob_identity" \
   --rendezvous "$rendezvous_url" \
+  --iroh-relay "$relay_url" \
+  "${relay_ca_args[@]}" \
+  --allow-insecure-relay \
   --message 'hello across two NATs' 2>&1); then
   printf 'Alice dial failed:\n%s\nBob listener:\n' "$dial_output" >&2
   sed -n '1,80p' "$work_dir/bob.log" >&2

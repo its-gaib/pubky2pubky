@@ -22,15 +22,17 @@ base64 = "0.22"
 clap = { version = "4.5", features = ["derive", "env"] }
 ed25519-dalek = "3.0"
 futures-util = "0.3"
-hmac = "0.12"
 hpke = { version = "0.14", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
+iroh = { version = "=1.1.0", default-features = false, features = ["portmapper", "tls-ring"] }
+n0-watcher = "1.0"
 pubky = { version = "0.11", features = ["json"] }
 pubky-common = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls-pki-types = "1.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_jcs = "0.2"
 serde_json = "1.0"
-sha1 = "0.10"
+subtle = "2.6"
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["full"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
@@ -40,7 +42,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
-webrtc = "0.20"
 zeroize = { version = "1.8", features = ["derive"] }
 
 [workspace.lints.rust]
@@ -52,3 +53,11 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false

@@ -12,7 +12,7 @@ use crate::{
     Result,
 };
 
-const CERTIFICATE_DOMAIN: &str = "hole-punchky/device-certificate/v1";
+const CERTIFICATE_DOMAIN: &str = "hole-punchky/device-certificate/v2";
 
 /// Return Unix time in whole seconds.
 #[must_use]
@@ -78,6 +78,8 @@ pub struct DeviceCertificateClaims {
     pub signing_key: String,
     /// Device X25519 HPKE public key, base64url without padding.
     pub encryption_key: String,
+    /// Dedicated iroh endpoint id in canonical z-base-32 form.
+    pub iroh_endpoint_id: String,
     /// Beginning of the certificate validity interval.
     pub issued_at: u64,
     /// End of the certificate validity interval.
@@ -119,6 +121,7 @@ impl DeviceCertificate {
         <<X25519HkdfSha256 as hpke::Kem>::PublicKey as Deserializable>::from_bytes(&encryption_key)
             .map_err(|_| ProtocolError::InvalidEncoding("HPKE public key"))?;
         parse_public_key(&self.claims.signing_key)?;
+        parse_public_key(&self.claims.iroh_endpoint_id)?;
 
         if let Some(required) = capability
             && !self
@@ -142,6 +145,23 @@ impl DeviceCertificate {
         parse_public_key(&self.claims.signing_key)
     }
 
+    /// Return the certified iroh endpoint id in the lowercase hexadecimal form used by
+    /// iroh relay authorization callouts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the endpoint id is not a canonical Ed25519 public key.
+    pub fn iroh_endpoint_id_hex(&self) -> Result<String> {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let key = parse_public_key(&self.claims.iroh_endpoint_id)?;
+        let mut encoded = String::with_capacity(64);
+        for byte in key.as_inner().as_bytes() {
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        Ok(encoded)
+    }
+
     pub(crate) fn encryption_public_key(
         &self,
     ) -> Result<<X25519HkdfSha256 as hpke::Kem>::PublicKey> {
@@ -163,6 +183,8 @@ pub struct DeviceCredential {
     signing_secret: String,
     /// X25519 HPKE secret, base64url without padding.
     encryption_secret: String,
+    /// Dedicated iroh Ed25519 secret, base64url without padding.
+    iroh_secret: String,
 }
 
 impl std::fmt::Debug for DeviceCredential {
@@ -172,6 +194,7 @@ impl std::fmt::Debug for DeviceCredential {
             .field("certificate", &self.certificate)
             .field("signing_secret", &"[REDACTED]")
             .field("encryption_secret", &"[REDACTED]")
+            .field("iroh_secret", &"[REDACTED]")
             .finish()
     }
 }
@@ -195,6 +218,7 @@ impl DeviceCredential {
         }
 
         let signing = Keypair::random();
+        let iroh = Keypair::random();
         let (encryption_private, encryption_public) = X25519HkdfSha256::gen_keypair();
         let signing_secret = Zeroizing::new(signing.secret());
         let mut encryption_secret_bytes = encryption_private.to_bytes();
@@ -207,9 +231,14 @@ impl DeviceCredential {
             device_id: device_id.into(),
             signing_key: signing.public_key().z32(),
             encryption_key: URL_SAFE_NO_PAD.encode(encryption_public.to_bytes()),
+            iroh_endpoint_id: iroh.public_key().z32(),
             issued_at,
             expires_at,
-            capabilities: vec!["rendezvous".to_owned(), "signal".to_owned()],
+            capabilities: vec![
+                "rendezvous".to_owned(),
+                "signal".to_owned(),
+                "iroh".to_owned(),
+            ],
         };
         let signature = root.sign(&canonical_for_signing(CERTIFICATE_DOMAIN, &claims)?);
         let certificate = DeviceCertificate {
@@ -221,6 +250,7 @@ impl DeviceCredential {
             certificate,
             signing_secret: URL_SAFE_NO_PAD.encode(&signing_secret[..]),
             encryption_secret: encoded_encryption_secret,
+            iroh_secret: URL_SAFE_NO_PAD.encode(iroh.secret()),
         })
     }
 
@@ -234,6 +264,38 @@ impl DeviceCredential {
     #[must_use]
     pub fn device_id(&self) -> &str {
         &self.certificate.claims.device_id
+    }
+
+    /// Dedicated iroh endpoint id certified for this device.
+    #[must_use]
+    pub fn iroh_endpoint_id(&self) -> &str {
+        &self.certificate.claims.iroh_endpoint_id
+    }
+
+    /// Decode and verify the dedicated iroh secret key.
+    ///
+    /// The returned bytes are zeroized on drop. Applications normally do not need this;
+    /// it exists so the native transport crate can construct the certified endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored secret is malformed or does not match the certificate.
+    #[doc(hidden)]
+    pub fn iroh_secret_key_bytes(&self) -> Result<Zeroizing<[u8; 32]>> {
+        let bytes = Zeroizing::new(
+            URL_SAFE_NO_PAD
+                .decode(&self.iroh_secret)
+                .map_err(|_| ProtocolError::InvalidEncoding("iroh secret key"))?,
+        );
+        let secret = Zeroizing::new(
+            <[u8; 32]>::try_from(bytes.as_slice())
+                .map_err(|_| ProtocolError::InvalidEncoding("iroh secret key"))?,
+        );
+        let key = Keypair::from_secret(&secret);
+        if key.public_key().z32() != self.certificate.claims.iroh_endpoint_id {
+            return Err(ProtocolError::InvalidEncoding("iroh secret key"));
+        }
+        Ok(secret)
     }
 
     pub(crate) fn signing_key(&self) -> Result<Keypair> {

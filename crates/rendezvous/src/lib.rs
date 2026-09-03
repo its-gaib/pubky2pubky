@@ -17,19 +17,17 @@ use axum::{
         State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use hmac::{Hmac, Mac as _};
 use hole_punchky_protocol::{
-    Accept, Authenticated, ClientFrame, EncryptedSignal, ErrorCode, IceServer, Knock,
-    MAX_CLOCK_SKEW_SECONDS, PROTOCOL_VERSION, Registration, Reject, ServerFrame, SignalKind,
-    TurnCredentials, TurnRequest, now_seconds,
+    Accept, Authenticated, ClientFrame, DeviceCertificate, EncryptedSignal, ErrorCode,
+    IROH_TRANSPORT, Knock, MAX_CLOCK_SKEW_SECONDS, PROTOCOL_VERSION, Registration, Reject,
+    ServerFrame, SignalKind, now_seconds,
 };
 use serde::Serialize;
-use sha1::Sha1;
+use subtle::ConstantTimeEq as _;
 use tokio::{
     net::TcpListener,
     sync::{Mutex, mpsc},
@@ -40,20 +38,12 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Runtime policy for a rendezvous deployment.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerConfig {
     /// Socket bound by [`serve`].
     pub bind: SocketAddr,
-    /// Public STUN URLs given to every authenticated client.
-    pub stun_urls: Vec<String>,
-    /// TURN URLs paired with generated REST credentials after session consent.
-    pub turn_urls: Vec<String>,
-    /// Coturn `static-auth-secret`; absent disables TURN credential minting.
-    pub turn_shared_secret: Option<String>,
     /// How long a pending or accepted rendezvous session remains routable.
     pub session_ttl: Duration,
-    /// How long a generated TURN credential remains valid.
-    pub turn_credential_ttl: Duration,
     /// Maximum complete WebSocket message size.
     pub max_message_bytes: usize,
     /// Maximum signed control-message validity window.
@@ -72,17 +62,16 @@ pub struct ServerConfig {
     pub registration_timeout: Duration,
     /// Accepted browser Origin values. Empty permits any origin.
     pub allowed_origins: Vec<String>,
+    /// Bearer secret required on the iroh relay's internal authorization callout.
+    /// Absent disables the internal endpoint.
+    pub relay_auth_secret: Option<String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: SocketAddr::from(([127, 0, 0, 1], 8080)),
-            stun_urls: vec!["stun:stun.l.google.com:19302".to_owned()],
-            turn_urls: Vec::new(),
-            turn_shared_secret: None,
             session_ttl: Duration::from_secs(120),
-            turn_credential_ttl: Duration::from_secs(300),
             max_message_bytes: 64 * 1024,
             max_auth_window: Duration::from_secs(120),
             knocks_per_minute: 30,
@@ -92,6 +81,7 @@ impl Default for ServerConfig {
             max_sessions: 10_000,
             registration_timeout: Duration::from_secs(10),
             allowed_origins: Vec::new(),
+            relay_auth_secret: None,
         }
     }
 }
@@ -106,12 +96,16 @@ struct Metrics {
     rejected_total: AtomicU64,
     auth_failures_total: AtomicU64,
     rate_limited_total: AtomicU64,
+    relay_auth_allowed_total: AtomicU64,
+    relay_auth_denied_total: AtomicU64,
 }
 
 #[derive(Clone)]
 struct Connection {
     identity: String,
     device_id: String,
+    certificate: DeviceCertificate,
+    iroh_endpoint_id_hex: String,
     sender: mpsc::Sender<ServerFrame>,
 }
 
@@ -129,10 +123,6 @@ struct Session {
     eligible_responders: HashMap<Uuid, String>,
     responder: Option<Participant>,
     expires_at: u64,
-    initiator_sequence: u64,
-    responder_sequence: u64,
-    offer_seen: bool,
-    answer_seen: bool,
 }
 
 #[derive(Default)]
@@ -185,18 +175,6 @@ impl ServerState {
         });
     }
 
-    fn public_ice_servers(&self) -> Vec<IceServer> {
-        if self.config.stun_urls.is_empty() {
-            Vec::new()
-        } else {
-            vec![IceServer {
-                urls: self.config.stun_urls.clone(),
-                username: None,
-                credential: None,
-            }]
-        }
-    }
-
     fn enforce_auth_window(&self, issued_at: u64, expires_at: u64) -> ServiceResult<()> {
         if expires_at.saturating_sub(issued_at) > self.config.max_auth_window.as_secs() {
             return Err(ServiceError::unauthorized(
@@ -227,6 +205,10 @@ impl ServerState {
             frame.payload.device_id.clone(),
             frame.payload.nonce.clone(),
         );
+        let iroh_endpoint_id_hex = frame
+            .certificate
+            .iroh_endpoint_id_hex()
+            .map_err(|_| ServiceError::unauthorized("invalid certified iroh endpoint id"))?;
         let mut core = self.core.lock().await;
         core.registration_nonces.retain(|_, expiry| *expiry >= now);
         if core.registration_nonces.contains_key(&nonce_key) {
@@ -274,6 +256,8 @@ impl ServerState {
         let connection = Connection {
             identity: frame.payload.identity.clone(),
             device_id: frame.payload.device_id.clone(),
+            certificate: frame.certificate,
+            iroh_endpoint_id_hex,
             sender,
         };
         core.connections.insert(connection_id, connection);
@@ -357,15 +341,19 @@ impl ServerState {
         connection_id: Uuid,
         identity: &str,
         device_id: &str,
+        certificate: &DeviceCertificate,
     ) -> ServiceResult<()> {
         let core = self.core.lock().await;
         let connection = core
             .connections
             .get(&connection_id)
             .ok_or_else(|| ServiceError::unauthorized("connection is not registered"))?;
-        if connection.identity != identity || connection.device_id != device_id {
+        if connection.identity != identity
+            || connection.device_id != device_id
+            || connection.certificate != *certificate
+        {
             return Err(ServiceError::unauthorized(
-                "message identity does not match connection",
+                "message credential does not match connection",
             ));
         }
         Ok(())
@@ -423,6 +411,7 @@ impl ServerState {
             connection_id,
             &frame.payload.identity,
             &frame.payload.device_id,
+            &frame.certificate,
         )
         .await?;
         if frame.payload.application.is_empty() || frame.payload.application.len() > 128 {
@@ -487,10 +476,6 @@ impl ServerState {
                 eligible_responders,
                 responder: None,
                 expires_at: session_expires_at,
-                initiator_sequence: 0,
-                responder_sequence: 0,
-                offer_seen: false,
-                answer_seen: false,
             },
         );
         drop(core);
@@ -508,6 +493,7 @@ impl ServerState {
             connection_id,
             &frame.payload.identity,
             &frame.payload.device_id,
+            &frame.certificate,
         )
         .await?;
 
@@ -591,6 +577,7 @@ impl ServerState {
             connection_id,
             &frame.payload.identity,
             &frame.payload.device_id,
+            &frame.certificate,
         )
         .await?;
 
@@ -663,13 +650,14 @@ impl ServerState {
             connection_id,
             &frame.header.from_identity,
             &frame.header.from_device_id,
+            &frame.certificate,
         )
         .await?;
 
         let session_id = frame.header.session_id;
         let kind = frame.header.kind;
         let mut core = self.core.lock().await;
-        let (destination_id, is_initiator) = {
+        let destination_id = {
             let session = core
                 .sessions
                 .get(&session_id)
@@ -681,17 +669,16 @@ impl ServerState {
                 ServiceError::bad_request("session has not been accepted").with_session(session_id)
             })?;
 
-            let (destination, expected_sequence, is_initiator) =
-                if session.initiator.connection_id == connection_id {
-                    (responder, session.initiator_sequence, true)
-                } else if responder.connection_id == connection_id {
-                    (&session.initiator, session.responder_sequence, false)
-                } else {
-                    return Err(
-                        ServiceError::unauthorized("connection is not bound to session")
-                            .with_session(session_id),
-                    );
-                };
+            let (destination, is_initiator) = if session.initiator.connection_id == connection_id {
+                (responder, true)
+            } else if responder.connection_id == connection_id {
+                (&session.initiator, false)
+            } else {
+                return Err(
+                    ServiceError::unauthorized("connection is not bound to session")
+                        .with_session(session_id),
+                );
+            };
             if frame.header.to_identity != destination.identity
                 || frame.header.to_device_id != destination.device_id
             {
@@ -700,20 +687,14 @@ impl ServerState {
                         .with_session(session_id),
                 );
             }
-            if frame.header.sequence != expected_sequence || expected_sequence == u64::MAX {
+            if frame.header.sequence != 0 {
                 return Err(
                     ServiceError::bad_request("signal sequence is not the next value")
                         .with_session(session_id),
                 );
             }
             match (is_initiator, kind) {
-                (true, SignalKind::Offer) if !session.offer_seen => {}
-                (false, SignalKind::Answer) if session.offer_seen && !session.answer_seen => {}
-                (true, SignalKind::Candidate | SignalKind::EndOfCandidates)
-                    if session.offer_seen => {}
-                (false, SignalKind::Candidate | SignalKind::EndOfCandidates)
-                    if session.answer_seen => {}
-                (_, SignalKind::Abort) => {}
+                (false, SignalKind::IrohEndpoint) | (_, SignalKind::Abort) => {}
                 _ => {
                     return Err(
                         ServiceError::bad_request("signal violates negotiation order")
@@ -721,7 +702,7 @@ impl ServerState {
                     );
                 }
             }
-            (destination.connection_id, is_initiator)
+            destination.connection_id
         };
         let sender = core
             .connections
@@ -733,90 +714,10 @@ impl ServerState {
         sender.try_send(ServerFrame::Signal(frame)).map_err(|_| {
             ServiceError::unavailable("peer connection is congested").with_session(session_id)
         })?;
-        if kind == SignalKind::Abort {
-            core.sessions.remove(&session_id);
-        } else if let Some(session) = core.sessions.get_mut(&session_id) {
-            if is_initiator {
-                session.initiator_sequence += 1;
-                if kind == SignalKind::Offer {
-                    session.offer_seen = true;
-                }
-            } else {
-                session.responder_sequence += 1;
-                if kind == SignalKind::Answer {
-                    session.answer_seen = true;
-                }
-            }
-        }
+        core.sessions.remove(&session_id);
         drop(core);
         self.metrics.signals_total.fetch_add(1, Ordering::Relaxed);
         Ok(())
-    }
-
-    async fn turn_credentials(
-        &self,
-        connection_id: Uuid,
-        frame: Authenticated<TurnRequest>,
-    ) -> ServiceResult<TurnCredentials> {
-        let now = now_seconds();
-        frame
-            .verify(now)
-            .map_err(|_| ServiceError::unauthorized("TURN request authentication failed"))?;
-        self.enforce_auth_window(frame.payload.issued_at, frame.payload.expires_at)?;
-        self.authenticated_connection(
-            connection_id,
-            &frame.payload.identity,
-            &frame.payload.device_id,
-        )
-        .await?;
-        let secret = self
-            .config
-            .turn_shared_secret
-            .as_ref()
-            .filter(|_| !self.config.turn_urls.is_empty())
-            .ok_or_else(|| {
-                ServiceError::turn_unavailable().with_session(frame.payload.session_id)
-            })?;
-
-        let core = self.core.lock().await;
-        let session = core
-            .sessions
-            .get(&frame.payload.session_id)
-            .ok_or_else(|| {
-                ServiceError::session_not_found().with_session(frame.payload.session_id)
-            })?;
-        if session.expires_at < now {
-            return Err(ServiceError::session_not_found().with_session(frame.payload.session_id));
-        }
-        let is_initiator = session.initiator.connection_id == connection_id;
-        let is_responder = session
-            .responder
-            .as_ref()
-            .is_some_and(|peer| peer.connection_id == connection_id);
-        if session.responder.is_none() || (!is_initiator && !is_responder) {
-            return Err(
-                ServiceError::unauthorized("TURN is available only to accepted peers")
-                    .with_session(frame.payload.session_id),
-            );
-        }
-        drop(core);
-
-        let expires_at = now.saturating_add(self.config.turn_credential_ttl.as_secs());
-        let username = format!(
-            "{}:{}:{}",
-            expires_at, frame.payload.identity, frame.payload.session_id
-        );
-        let mut mac = Hmac::<Sha1>::new_from_slice(secret.as_bytes())
-            .map_err(|_| ServiceError::internal())?;
-        mac.update(username.as_bytes());
-        let credential = STANDARD.encode(mac.finalize().into_bytes());
-        Ok(TurnCredentials {
-            session_id: frame.payload.session_id,
-            urls: self.config.turn_urls.clone(),
-            username,
-            credential,
-            expires_at,
-        })
     }
 }
 
@@ -847,15 +748,6 @@ impl ServiceError {
     const fn rate_limited(message: &'static str) -> Self {
         Self::new(ErrorCode::RateLimited, message)
     }
-    const fn turn_unavailable() -> Self {
-        Self::new(
-            ErrorCode::TurnUnavailable,
-            "TURN fallback is not configured",
-        )
-    }
-    const fn internal() -> Self {
-        Self::new(ErrorCode::Internal, "internal server error")
-    }
     const fn new(code: ErrorCode, message: &'static str) -> Self {
         Self {
             code,
@@ -880,8 +772,9 @@ impl ServiceError {
 pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/healthz", get(health))
-        .route("/v1/config", get(public_config))
-        .route("/v1/ws", get(websocket_upgrade))
+        .route("/v2/config", get(public_config))
+        .route("/v2/ws", get(websocket_upgrade))
+        .route("/internal/relay/authorize", post(relay_authorize))
         .route("/metrics", get(metrics))
         .layer(TraceLayer::new_for_http())
         .layer(CatchPanicLayer::new())
@@ -904,8 +797,9 @@ async fn health() -> Json<Health<'static>> {
 #[derive(Serialize)]
 struct PublicConfig {
     protocol_version: u16,
-    stun_urls: Vec<String>,
-    turn_available: bool,
+    transport: &'static str,
+    consent_required: bool,
+    relay_access_managed: bool,
     session_ttl_seconds: u64,
     max_message_bytes: usize,
 }
@@ -913,12 +807,77 @@ struct PublicConfig {
 async fn public_config(State(state): State<ServerState>) -> Json<PublicConfig> {
     Json(PublicConfig {
         protocol_version: PROTOCOL_VERSION,
-        stun_urls: state.config.stun_urls.clone(),
-        turn_available: state.config.turn_shared_secret.is_some()
-            && !state.config.turn_urls.is_empty(),
+        transport: IROH_TRANSPORT,
+        consent_required: true,
+        relay_access_managed: state.config.relay_auth_secret.is_some(),
         session_ttl_seconds: state.config.session_ttl.as_secs(),
         max_message_bytes: state.config.max_message_bytes,
     })
+}
+
+async fn relay_authorize(State(state): State<ServerState>, headers: HeaderMap) -> Response {
+    let Some(expected_secret) = state.config.relay_auth_secret.as_deref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let supplied_secret = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token);
+    let authenticated = supplied_secret.is_some_and(|supplied| {
+        supplied.len() == expected_secret.len()
+            && bool::from(supplied.as_bytes().ct_eq(expected_secret.as_bytes()))
+    });
+    // iroh-relay 1.1 sends X-Iroh-NodeId even though its public documentation names
+    // X-Iroh-Endpoint-Id. Accept both during the upstream transition, but never accept
+    // ambiguous values when a proxy or caller supplies both names.
+    let node_id = headers
+        .get("x-iroh-nodeid")
+        .and_then(|value| value.to_str().ok());
+    let documented_id = headers
+        .get("x-iroh-endpoint-id")
+        .and_then(|value| value.to_str().ok());
+    let endpoint_id = match (node_id, documented_id) {
+        (Some(node), Some(documented)) if node == documented => Some(node),
+        (Some(node), None) => Some(node),
+        (None, Some(documented)) => Some(documented),
+        _ => None,
+    }
+    .filter(|value| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    });
+    let allowed = if authenticated {
+        if let Some(endpoint_id) = endpoint_id {
+            state
+                .core
+                .lock()
+                .await
+                .connections
+                .values()
+                .any(|connection| connection.iroh_endpoint_id_hex == endpoint_id)
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if allowed {
+        state
+            .metrics
+            .relay_auth_allowed_total
+            .fetch_add(1, Ordering::Relaxed);
+        (StatusCode::OK, "true").into_response()
+    } else {
+        state
+            .metrics
+            .relay_auth_denied_total
+            .fetch_add(1, Ordering::Relaxed);
+        (StatusCode::FORBIDDEN, "false").into_response()
+    }
 }
 
 async fn metrics(State(state): State<ServerState>) -> Response {
@@ -942,7 +901,11 @@ async fn metrics(State(state): State<ServerState>) -> Response {
             "# TYPE hole_punchky_auth_failures_total counter\n",
             "hole_punchky_auth_failures_total {}\n",
             "# TYPE hole_punchky_rate_limited_total counter\n",
-            "hole_punchky_rate_limited_total {}\n"
+            "hole_punchky_rate_limited_total {}\n",
+            "# TYPE hole_punchky_relay_auth_allowed_total counter\n",
+            "hole_punchky_relay_auth_allowed_total {}\n",
+            "# TYPE hole_punchky_relay_auth_denied_total counter\n",
+            "hole_punchky_relay_auth_denied_total {}\n"
         ),
         state.metrics.connections.load(Ordering::Relaxed),
         sessions,
@@ -953,6 +916,14 @@ async fn metrics(State(state): State<ServerState>) -> Response {
         state.metrics.rejected_total.load(Ordering::Relaxed),
         state.metrics.auth_failures_total.load(Ordering::Relaxed),
         state.metrics.rate_limited_total.load(Ordering::Relaxed),
+        state
+            .metrics
+            .relay_auth_allowed_total
+            .load(Ordering::Relaxed),
+        state
+            .metrics
+            .relay_auth_denied_total
+            .load(Ordering::Relaxed),
     );
     (
         StatusCode::OK,
@@ -1029,8 +1000,8 @@ async fn websocket(mut socket: WebSocket, state: ServerState) {
     };
     let registered = ServerFrame::Registered {
         connection_id,
-        ice_servers: state.public_ice_servers(),
         session_ttl_seconds: state.config.session_ttl.as_secs(),
+        transport: IROH_TRANSPORT.to_owned(),
     };
     if send_frame_socket(&mut socket, &registered).await.is_err() {
         state.disconnect(connection_id).await;
@@ -1091,19 +1062,6 @@ async fn handle_frame(
         ClientFrame::Accept(frame) => state.accept(connection_id, frame).await,
         ClientFrame::Reject(frame) => state.reject(connection_id, frame).await,
         ClientFrame::Signal(frame) => state.signal(connection_id, frame).await,
-        ClientFrame::RequestTurnCredentials(frame) => {
-            let credentials = state.turn_credentials(connection_id, frame).await?;
-            let core = state.core.lock().await;
-            let sender = core
-                .connections
-                .get(&connection_id)
-                .map(|connection| connection.sender.clone())
-                .ok_or_else(|| ServiceError::unauthorized("connection is not registered"))?;
-            drop(core);
-            sender
-                .try_send(ServerFrame::TurnCredentials(credentials))
-                .map_err(|_| ServiceError::unavailable("connection is congested"))
-        }
         ClientFrame::Ping { nonce } => {
             if nonce.len() > 256 {
                 return Err(ServiceError::bad_request("ping nonce is too long"));

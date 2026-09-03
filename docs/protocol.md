@@ -1,150 +1,172 @@
-# Hole Punchky protocol v1
+# Hole Punchky protocol v2
 
-This document is normative for v1. The Rust types in `hole-punchky-protocol` are the executable reference implementation.
+This document is normative for v2. The Rust types in `hole-punchky-protocol` and the state machine in `hole-punchky-rendezvous` are the executable reference implementation.
 
 ## Conventions
 
-- Identity strings are bare 52-character z-base-32 Pubky/PKARR Ed25519 public keys.
+- Identity and endpoint strings are bare, canonical 52-character z-base-32 Ed25519 public keys.
 - Time fields are unsigned Unix seconds in UTC.
-- UUIDs are canonical lowercase UUID strings.
-- Binary values are unpadded base64url, except TURN REST passwords, which use padded standard base64 as required by coturn.
-- JSON signatures use RFC 8785 JSON Canonicalization Scheme (JCS).
-- The signable bytes are the JCS encoding of `{"domain": DOMAIN, "payload": VALUE}`.
-- Implementations must reject unknown protocol versions. JSON decoders may ignore unknown object fields for forward compatibility.
-- Signed control objects are accepted with at most 120 seconds of clock skew. The reference server additionally limits each control object's validity window to 120 seconds.
+- Session IDs are canonical UUID strings generated with UUIDv4 entropy.
+- Binary values are unpadded base64url.
+- Signatures cover RFC 8785 JSON Canonicalization Scheme (JCS) bytes.
+- A signable value is `JCS({"domain": DOMAIN, "payload": VALUE})`.
+- Implementations reject unknown protocol versions. JSON decoders may ignore unknown object fields for forward compatibility within a version.
+- Signed messages allow at most 120 seconds of clock skew. The reference server also caps each signed control validity window at 120 seconds.
+- Protocol v2 is not wire-compatible with the former WebRTC protocol v1. There is no downgrade path.
 
-## Cryptographic suites
+## Cryptography and transport
 
-| Purpose | Suite |
+| Purpose | Construction |
 | --- | --- |
-| Pubky root and device signatures | Ed25519 |
+| Pubky root, control, and iroh keys | Independent Ed25519 keypairs |
 | Signable representation | RFC 8785 JCS |
-| Signaling encryption | RFC 9180 HPKE base mode |
+| Address encryption | RFC 9180 HPKE base mode |
 | HPKE KEM | DHKEM(X25519, HKDF-SHA-256), `0x0020` |
 | HPKE KDF | HKDF-SHA-256, `0x0001` |
 | HPKE AEAD | ChaCha20-Poly1305, `0x0003` |
-| HPKE `info` | UTF-8 `hole-punchky/hpke-signal/v1` |
+| HPKE `info` | `hole-punchky/hpke-signal/v2` |
+| Peer transport | iroh 1.1 authenticated QUIC |
+| QUIC ALPN | `hole-punchky/iroh/2` |
+| Application framing | Four-byte unsigned big-endian length followed by bytes |
 
-Ed25519 and X25519 keys are generated independently. Converting or reusing a Pubky Ed25519 secret as an X25519 key is not permitted.
+Root, control-signing, HPKE, and iroh secrets must not be derived from or reused as one another.
 
 ## Root-to-device delegation
 
-Applications should not keep the Pubky root key in a long-running network process. The root signs a `DeviceCertificateClaims` object:
+The Pubky root signs these claims using domain `hole-punchky/device-certificate/v2`:
 
 ```json
 {
-  "version": 1,
-  "identity": "<root-z32>",
+  "version": 2,
+  "identity": "<pubky-root-z32>",
   "device_id": "laptop",
-  "signing_key": "<device-ed25519-z32>",
-  "encryption_key": "<device-x25519-base64url>",
+  "signing_key": "<control-ed25519-z32>",
+  "encryption_key": "<hpke-x25519-base64url>",
+  "iroh_endpoint_id": "<iroh-ed25519-z32>",
   "issued_at": 1788360000,
   "expires_at": 1788446400,
-  "capabilities": ["rendezvous", "signal"]
+  "capabilities": ["rendezvous", "signal", "iroh"]
 }
 ```
 
-The enclosing certificate has `claims` and `signature`. Its signature domain is `hole-punchky/device-certificate/v1`. The reference implementation accepts a maximum certificate lifetime of 90 days; deployments should issue much shorter credentials where root-key access permits.
+The enclosing `DeviceCertificate` has `claims` and a root `signature`. The reference implementation permits at most a 90-day certificate lifetime. Operators should use shorter lifetimes and reissue a device after loss or suspected compromise.
 
-Every authenticated control object has:
-
-```json
-{
-  "payload": { "...": "message-specific claims" },
-  "certificate": { "claims": {}, "signature": "..." },
-  "signature": "<device signature>"
-}
-```
-
-The device signature uses the message-specific domain. The payload identity and device id must equal the certificate claims.
+An `Authenticated<T>` control frame contains `payload`, `certificate`, and a signature by `signing_key`. Its payload identity and device ID must match the certificate. Registration, knock, accept, and reject use distinct signing domains.
 
 ## Pubky discovery
 
-The target publishes JSON at `/pub/hole-punchky/v1/descriptor.json`. The complete Pubky URI is:
+B publishes a `RendezvousDescriptor` at:
 
 ```text
-pubky://<root-z32>/pub/hole-punchky/v1/descriptor.json
+pubky://<root-z32>/pub/hole-punchky/v2/descriptor.json
 ```
 
-Claims contain `version`, `identity`, `endpoints`, and `expires_at`. Each endpoint has `signaling_url`, numeric `priority` (lower wins), and optional `region`. The root-signature domain is `hole-punchky/rendezvous-descriptor/v1`.
+Claims contain:
 
-Clients must:
+- `version: 2`;
+- the root `identity`;
+- one to eight `endpoints`, each with `signaling_url`, `priority`, and optional `region`;
+- `transports`, which must include `iroh-quic-v1`;
+- `expires_at`.
 
-1. resolve the URI through the standard Pubky SDK (thereby using PKARR homeserver discovery);
-2. require `claims.identity` to equal the requested key;
-3. verify the root signature and expiry;
-4. require `wss://`, except explicit loopback development;
-5. try endpoints in ascending priority order.
+The root signature domain is `hole-punchky/rendezvous-descriptor/v2`. A client resolves the URI with the Pubky SDK, which performs PKARR homeserver discovery, and then independently verifies identity, signature, version, expiry, transport support, and URL policy. It tries endpoints by ascending priority.
 
-The record is root-signed even though Pubky storage already authenticates the account. This permits caching/mirroring without inheriting transport trust.
+Public signaling URLs must use `wss://`. The reference permits `ws://localhost` or a loopback literal only for explicit local development. Relay coordinates are deliberately absent from this public descriptor; B releases its current address only after consent.
 
-## WebSocket transport
+## WebSocket registration
 
-The endpoint path is `/v1/ws`. Frames are UTF-8 JSON. The default maximum message is 65,536 bytes. A frame is an externally tagged object with `type` and `data`, for example:
+The path is `/v2/ws`; frames are UTF-8 JSON tagged with `type` and `data`. The first frame must be `register`, signed with domain `hole-punchky/register/v2`. It contains version, identity, device ID, a fresh 16-to-256-character nonce, issue time, and expiry.
+
+The server verifies the root delegation and control signature before inserting presence. It binds the socket to the complete device certificate; later signed frames using another certificate are rejected even if the root identity and device label match. A tuple of identity, device ID, and nonce cannot be reused through its signed validity plus accepted clock skew.
+
+The response is:
 
 ```json
-{"type":"ping","data":{"nonce":"abc"}}
+{
+  "type": "registered",
+  "data": {
+    "connection_id": "<uuid>",
+    "session_ttl_seconds": 120,
+    "transport": "iroh-quic-v1"
+  }
+}
 ```
 
-The first frame must be `register`. Its payload includes `version`, `identity`, `device_id`, a fresh nonce, `issued_at`, and `expires_at`. Its signing domain is `hole-punchky/register/v1`. A registration nonce cannot be reused during its validity period.
-
-The server answers `registered` with a connection UUID, public STUN configuration, and the session TTL. TURN credentials are never included before consent.
-
-An idle native client sends an application `ping` on its authenticated socket every 25 seconds by default; the server answers `pong`. Deployments should keep their proxy idle timeout above this interval. Implementations may choose another non-zero interval appropriate to their network.
+Clients send application `ping` frames by default every 25 seconds; the server returns `pong`. Proxies must have a longer idle timeout.
 
 ## Consent and session binding
 
-The initiator chooses a random UUIDv4 session id and sends `knock`. A knock contains no SDP, IP address, or ICE candidate. It contains the target identity, optional target device id, application protocol, and optional non-secret metadata. Domain: `hole-punchky/knock/v1`.
+The initiator sends a signed `knock` using domain `hole-punchky/knock/v2`. It includes a new session UUID, B's identity, optional exact B device ID, requested application string, optional non-secret metadata, and validity times. It contains no IP address, relay URL, or QUIC traffic.
 
-The rendezvous server fans a valid knock out to all matching online devices. Only device connections to which that knock was successfully queued may answer; a device that connects later cannot guess and claim the session UUID. The first valid `accept` atomically binds that exact responder connection to the session. Later accepts receive `session_claimed`. Domain: `hole-punchky/accept/v1`.
+The server records exactly which connected B devices successfully received the fan-out. A later connection cannot claim the session. The first eligible signed `accept` atomically selects one responder and is forwarded to A; its domain is `hole-punchky/accept/v2`. Later acceptances receive `session_claimed`.
 
-A target can send `reject` with a reason. Domain: `hole-punchky/reject/v1`. For a fan-out knock, the server reports rejection to the initiator only after every device that received the knock has rejected; one rejection does not prevent another target device from accepting. For an exact-device knock, rejection terminates the session.
+A signed `reject` uses domain `hole-punchky/reject/v2`. With fan-out, A receives a rejection only when every eligible device rejects. An acceptance by another device can still win.
 
-The server enforces a two-minute default session TTL and deletes sessions when a bound socket disconnects. It retains a bounded session-ID tombstone through the signed knock's clock-skew acceptance window, so an ended session cannot be recreated by replaying its original knock.
+Pending and accepted sessions expire after 120 seconds by default. The server retains a bounded session-ID tombstone long enough to reject replay of the original signed knock.
 
-## Encrypted signaling
+## Encrypted endpoint release
 
-After acceptance, each side knows the other's root-signed device certificate. An `EncryptedSignal` has a public header, sender certificate, HPKE encapsulated key, ciphertext, and device signature.
+After acceptance, only the selected responder may send `iroh_endpoint`, at sequence zero. Either bound side may instead send `abort`, also at sequence zero. Any other direction, kind, sequence, sender, recipient, or session is rejected.
 
-The public header contains:
+An `EncryptedSignal` exposes only:
 
-- version and session UUID;
+- protocol version and session UUID;
 - exact sender and recipient identity/device pairs;
-- a strictly increasing sequence beginning at zero independently in each direction;
-- kind: `offer`, `answer`, `candidate`, `end_of_candidates`, or `abort`;
-- issued and expiry times.
+- sequence, kind, issue time, and expiry;
+- the sender device certificate;
+- HPKE encapsulated key, ciphertext, and control-key signature.
 
-The JCS header bytes are HPKE associated data. The plaintext is one `SignalPayload`. The device signs a structure containing the header, encoded encapsulated key, and encoded ciphertext with domain `hole-punchky/encrypted-signal/v1`.
+The header JCS bytes are HPKE associated data. The device signs the complete opaque envelope with domain `hole-punchky/encrypted-signal/v2`. The rendezvous authenticates and routes it but cannot decrypt its payload.
 
-The rendezvous verifies the certificate, signature, bound sender/recipient, sequence, expiry, and negotiation order. It cannot decrypt the payload. The recipient repeats every verification before HPKE decryption and checks that the plaintext variant agrees with the public `kind`.
+For `iroh_endpoint`, the decrypted payload is:
 
-Allowed order is:
-
-1. initiator `offer` at sequence 0;
-2. responder `answer` at sequence 0;
-3. either side may send candidates/end markers after its own description;
-4. either side may abort.
-
-The reference native client places gathered candidates inside encrypted SDP, so only offer and answer are normally emitted.
-
-## TURN fallback
-
-After a session is accepted, either bound peer may send a signed `request_turn_credentials` (domain `hole-punchky/turn-request/v1`). The server creates a short-lived coturn REST username:
-
-```text
-<expiry-unix>:<identity>:<session-uuid>
+```json
+{
+  "type": "iroh_endpoint",
+  "endpoint": {
+    "endpoint_id": "<responder-iroh-z32>",
+    "relay_urls": ["https://relay.example.com/"],
+    "direct_addresses": ["192.0.2.10:49152"]
+  }
+}
 ```
 
-The credential is `base64(HMAC-SHA1(static-auth-secret, username))`. Default validity is five minutes. The response includes the session id to disambiguate concurrent negotiations.
+There may be at most eight relay URLs and 32 direct addresses, and at least one address is required. Relay schemes are HTTP or HTTPS at the wire-type layer; native production clients require HTTPS and allow HTTP only for an explicitly enabled loopback development host. Direct addresses cannot have port zero or an unspecified/multicast IP.
 
-TURN-only ICE is a privacy mode. Normal ICE includes host, server-reflexive, and relay candidates; it prefers a direct pair and automatically falls back to TURN. The reference native client supports UDP TURN in v1 and ignores TCP/TLS TURN URLs; those transports remain usable by browser implementations and reserved for future native support.
+The recipient repeats envelope verification, HPKE decryption, kind validation, and address validation. `endpoint_id` must equal the sender certificate's `iroh_endpoint_id`. The accept and signal certificates must also be identical. Successful forwarding of an endpoint or abort ends the rendezvous session.
 
-## Server errors
+## Iroh QUIC binding
 
-Errors contain a stable `code`, safe `message`, and optional `session_id`. Codes are `bad_request`, `unauthorized`, `unavailable`, `session_not_found`, `session_claimed`, `rate_limited`, `too_large`, `turn_unavailable`, and `internal`.
+Each client constructs iroh using the `Minimal` preset, its certified dedicated secret, the fixed ALPN, no n0 address lookup, and only explicitly configured relays. Direct mode enables configured IP sockets and port mapping; relay-only mode removes all IP transports.
 
-Clients must treat authentication, identity, sequence, and HPKE failures as terminal for that session. They may retry `unavailable` with endpoint backoff and a new session UUID.
+A dials B only after processing both acceptance and endpoint ciphertext. Iroh authenticates B's endpoint ID in the QUIC certificate. B continuously accepts the ALPN but exposes a connection to the application only after receiving this stream hello:
 
-## Application data
+```json
+{
+  "version": 2,
+  "session_id": "<accepted-uuid>",
+  "from_identity": "<A-root-z32>",
+  "from_device_id": "alice-laptop",
+  "to_identity": "<B-root-z32>",
+  "to_device_id": "bob-phone",
+  "application": "example/1"
+}
+```
 
-After ICE nomination, WebRTC authenticates and encrypts the path with DTLS and carries reliable ordered messages over SCTP. Hole Punchky does not define application payloads. Applications identify their protocol in the knock and should add their own versioning, authorization, and flow control. The reference wrapper caps individual messages at 16 KiB for portable DataChannel interoperability.
+The JSON is length-prefixed and capped at 16 KiB. B requires a locally pending accepted session and exact matches for A's QUIC endpoint ID, both identity/device pairs, session, protocol version, and application. It atomically consumes that pending entry and responds with a length-prefixed `{"version":2,"session_id":"..."}` acknowledgement. A exposes the peer only after validating the acknowledgement.
+
+This second binding prevents a valid iroh endpoint from substituting another accepted Pubky session or application. Unknown and replayed connections are closed.
+
+Subsequent frames are opaque application bytes with a four-byte big-endian length. The reference cap is 16 MiB and is configurable downwards. Hole Punchky guarantees an authenticated reliable ordered byte-message channel but does not define application payload semantics, authorization, or flow control above QUIC.
+
+## Relay access
+
+The supplied deployment configures the official iroh relay's HTTP access mode. For each relay connection the pinned 1.1 binary posts an `X-Iroh-NodeId` hexadecimal key to `/internal/relay/authorize`. (Its documentation calls this `X-Iroh-Endpoint-Id`; the callback also accepts that spelling for forward compatibility and rejects conflicting duplicates.) The call is authenticated by a bearer secret shared only between relay and rendezvous. The rendezvous returns exactly `true` only if that endpoint ID belongs to a currently connected, successfully authenticated Pubky device.
+
+This admission is not peer consent: it merely makes the device reachable at the relay. The target's address and any peer handshake remain blocked until accept. The internal endpoint must not be exposed through the public reverse proxy.
+
+## Errors
+
+WebSocket errors contain a stable `code`, safe `message`, and optional `session_id`. Codes are `bad_request`, `unauthorized`, `unavailable`, `session_not_found`, `session_claimed`, `rate_limited`, `too_large`, and `internal`.
+
+Authentication, identity, endpoint binding, HPKE, or stream-hello failures are terminal for that session. A caller may retry `unavailable` against another signed rendezvous endpoint with a new UUID and fresh signed messages.

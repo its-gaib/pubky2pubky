@@ -1,146 +1,153 @@
 # Hole Punchky
 
-Hole Punchky establishes an authenticated WebRTC DataChannel between two devices that know only each other's Pubky identity. Both devices may be behind NAT/firewalls. The target's existing Pubky homeserver publishes discovery data; a small public sidecar coordinates consent and encrypted ICE signaling; STUN performs UDP hole punching; TURN is the unavoidable fallback when a direct path cannot be formed.
+Hole Punchky establishes an authenticated iroh QUIC stream between two native devices that initially know only each other's Pubky identity. Both devices may be behind NAT and firewalls. Pubky/PKARR supplies discovery and root identity, a small public rendezvous service obtains explicit consent, and iroh performs NAT traversal with a self-hosted relay fallback.
 
-The rendezvous service never receives plaintext SDP or ICE candidates. A Pubky root key delegates a short-lived device signing key and a separate X25519 encryption key. All signaling is sender-signed, recipient-encrypted with RFC 9180 HPKE, replay-bounded, and routed only after the target accepts a knock.
+The target's addresses are not disclosed and no peer QUIC handshake starts before acceptance. After consent, the target sends one HPKE-encrypted iroh `EndpointAddr`. Iroh first gives the peers a reliable relay path, tries UDP hole punching, and moves QUIC to a direct path when the network permits it. Application bytes remain end-to-end encrypted on either path.
 
 ```mermaid
 sequenceDiagram
-    participant A as Device A (behind NAT)
-    participant P as PKARR + B's homeserver
-    participant R as Rendezvous sidecar
-    participant B as Device B (behind NAT)
-    participant T as STUN/TURN
-    B->>R: outbound WSS + signed registration
-    A->>P: resolve B, GET signed descriptor
-    A->>R: outbound WSS + signed registration
-    A->>R: signed knock (no network candidates)
-    R->>B: fan out knock
+    participant A as Device A behind NAT
+    participant P as PKARR + B homeserver
+    participant R as Consent rendezvous
+    participant I as Self-hosted iroh relay
+    participant B as Device B behind NAT
+    B->>R: signed device registration
+    B->>I: outbound relay registration
+    A->>P: resolve B and fetch signed descriptor
+    A->>R: signed device registration
+    A->>I: outbound relay registration
+    A->>R: signed knock (no addresses)
+    R->>B: consent request
     B->>R: signed accept
-    R->>A: accept + B device certificate
-    A-->>R: HPKE(SDP + ICE candidates)
-    R-->>B: opaque ciphertext
-    B-->>R: HPKE(answer + ICE candidates)
+    R->>A: accept + root-signed device certificate
+    B-->>R: HPKE-encrypted iroh endpoint address
     R-->>A: opaque ciphertext
-    A->>T: gather public/relay candidates
-    B->>T: gather public/relay candidates
-    A<<->>B: ICE connectivity checks
-    A<<->>B: direct DTLS/SCTP DataChannel, or TURN relay
+    A->>B: iroh QUIC authenticated by certified endpoint keys
+    A<<->>I: encrypted fallback path
+    A<<->>B: direct QUIC after successful hole punch
 ```
 
-No homeserver fork is required. The descriptor is an ordinary file at:
+No `pubky-homeserver` fork is required. The unmodified homeserver stores one ordinary signed file:
 
 ```text
-pubky://<identity>/pub/hole-punchky/v1/descriptor.json
+pubky://<identity>/pub/hole-punchky/v2/descriptor.json
 ```
 
-The rendezvous server can run beside `pubky-homeserver`, behind the same reverse proxy, or as a shared independent service. See [architecture.md](docs/architecture.md) for the integration decision and [protocol.md](docs/protocol.md) for the normative wire protocol.
+See [architecture.md](docs/architecture.md) for the homeserver decision, [protocol.md](docs/protocol.md) for the normative protocol, and [threat-model.md](docs/threat-model.md) before operating it publicly.
 
-## What is implemented
+## Implemented
 
-- Root-signed device delegation using Pubky/PKARR Ed25519 identities.
-- Separate device Ed25519 signing and X25519 HPKE encryption keys.
-- RFC 8785 canonical JSON signatures with explicit domain separation.
-- RFC 9180 base-mode HPKE using X25519/HKDF-SHA-256/ChaCha20-Poly1305.
-- Signed Pubky discovery descriptors with expiry and endpoint priority.
-- Automatic failover across verified descriptor endpoints in priority order.
-- WebSocket rendezvous with registration replay defense, consent-first knocks, multi-device fan-out, first-accept binding, strict signal sequencing, bounded frames, rate limiting, and expiry.
-- Session-scoped coturn REST credentials issued only after consent.
-- Native Rust client using ICE, DTLS, SCTP, and binary/text WebRTC DataChannels.
-- Direct-versus-relayed path reporting from the nominated local ICE candidate.
-- Health, public configuration, and Prometheus metrics endpoints.
-- Docker deployment for the sidecar plus separate STUN and authenticated TURN listeners.
-- Unit, live-WebSocket, direct-ICE, two-NAT namespace, TURN-only, CLI, and Pubky-testnet test paths.
+- Pubky-root-signed device certificates with independent Ed25519 control-signing, X25519 HPKE, and Ed25519 iroh endpoint keys.
+- Signed, expiring Pubky discovery descriptors and priority-ordered endpoint failover.
+- Consent-first WebSocket rendezvous with replay defense, multi-device fan-out, first-responder binding, strict routing, expiry, quotas, and payload blindness.
+- A single responder address signal, encrypted using RFC 9180 HPKE and bound to the responder certificate.
+- Iroh 1.1 QUIC with QUIC address discovery, direct path migration, port mapping, self-hosted relay fallback, relay-only privacy mode, and path reporting.
+- A session-bound QUIC stream hello/ack that rechecks Pubky identities, devices, application protocol, session UUID, and both certified iroh endpoint IDs.
+- Relay admission for currently registered, root-delegated devices through the official iroh relay HTTP authorization hook.
+- Length-delimited binary messages up to a configurable 16 MiB default.
+- Health, public configuration, Prometheus metrics, Docker Compose, CLI, AsyncAPI, and OpenAPI surfaces.
+- Cryptographic tamper tests, live WebSocket tests, direct QUIC tests, forced-relay tests, a two-NAT Linux namespace lab, container smoke tests, and Pubky testnet discovery tests.
 
 ## Quick local run
 
-Rust 1.91+ is required.
+Rust 1.91+ and Docker Compose are required.
+
+```bash
+export HPK_RELAY_AUTH_SECRET="$(openssl rand -hex 32)"
+docker compose -f deploy/docker-compose.yml up --build --detach --wait
+# The local image creates a development CA for iroh QUIC address discovery.
+docker compose -f deploy/docker-compose.yml cp iroh-relay:/etc/iroh-relay/relay-ca.crt /tmp/hole-punchky-relay-ca.crt
+```
+
+Create two identities in separate files:
 
 ```bash
 cargo run -p hole-punchky -- init \
-  --device-id laptop \
-  --root-out root.key.json \
-  --device-out laptop.key.json
+  --device-id alice-laptop \
+  --root-out alice.root.json \
+  --device-out alice.device.json
 
-export HPK_TURN_SHARED_SECRET="$(openssl rand -hex 32)"
-docker compose -f deploy/docker-compose.yml up --build -d
-
-cargo run -p hole-punchky -- descriptor \
-  --root root.key.json \
-  --rendezvous ws://127.0.0.1:8080/v1/ws \
-  --out descriptor.json
+cargo run -p hole-punchky -- init \
+  --device-id bob-phone \
+  --root-out bob.root.json \
+  --device-out bob.device.json
 ```
 
-For a two-device smoke test, issue a second identity/device in another directory. Run the listener with explicit demo consent:
+Listen as Bob. `--accept` is intentionally explicit and intended for tests or demos; a real application should show the knock details to a user or apply its own policy.
 
 ```bash
 cargo run -p hole-punchky -- listen \
-  --device bob.key.json \
-  --rendezvous ws://127.0.0.1:8080/v1/ws \
+  --device bob.device.json \
+  --rendezvous ws://127.0.0.1:8080/v2/ws \
+  --iroh-relay http://127.0.0.1:3340 \
+  --iroh-relay-ca /tmp/hole-punchky-relay-ca.crt \
+  --allow-insecure-relay \
   --accept --echo --once
 ```
 
-Then dial it using the printed Bob identity:
+Dial with the Bob identity printed by `init`:
 
 ```bash
 cargo run -p hole-punchky -- dial \
-  --device alice.key.json \
+  --device alice.device.json \
   --peer <bob-z32-identity> \
-  --rendezvous ws://127.0.0.1:8080/v1/ws \
+  --rendezvous ws://127.0.0.1:8080/v2/ws \
+  --iroh-relay http://127.0.0.1:3340 \
+  --iroh-relay-ca /tmp/hole-punchky-relay-ca.crt \
+  --allow-insecure-relay \
   --message hello
 ```
 
-`ws://` is intentionally accepted only for loopback. Public descriptors and clients require `wss://`.
+Plain `ws://` rendezvous and `http://` relay URLs are accepted only with a loopback hostname and explicit relay opt-in. Public deployments require `wss://` and `https://`.
 
-## Publish discovery through Pubky
+The root key is a development fallback for signing. Applications should keep the Pubky root in Pubky Ring and provide a signer adapter for root-signed device certificates and descriptors; the rendezvous and QUIC client never need the root secret. The wire format already authenticates the root public key and signatures independently of where the signing operation runs.
 
-The Pubky identity must already have a homeserver account. Sign the descriptor with the same root, then publish it:
+## Pubky discovery
+
+Sign a descriptor for the rendezvous service:
+
+```bash
+cargo run -p hole-punchky -- descriptor \
+  --root bob.root.json \
+  --rendezvous wss://connect.example.com/v2/ws \
+  --out bob.descriptor.json
+```
+
+The identity must have a homeserver account. Publish using the same root key:
 
 ```bash
 cargo run -p hole-punchky -- publish \
-  --root root.key.json \
-  --descriptor descriptor.json
+  --root bob.root.json \
+  --descriptor bob.descriptor.json
 ```
 
-Use `--testnet` with the local Pubky development environment. A new development identity can be registered first:
-
-```bash
-cargo run -p hole-punchky -- signup \
-  --testnet \
-  --root root.key.json \
-  --homeserver <local-homeserver-z32-key>
-```
-
-Resolve independently with:
-
-```bash
-cargo run -p hole-punchky -- resolve --identity <z32-identity>
-```
+Pass `--testnet` to `signup`, `publish`, or discovery-based `dial` when using the local Pubky development environment. The relay URL is intentionally supplied to each running device rather than published in plaintext; the responder's current relay and direct coordinates arrive encrypted after consent.
 
 ## Test
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
-cargo audit
+./scripts/test-all.sh
 ```
 
-The TURN-only test is ignored unless coturn is available:
+Docker and privileged Linux network namespaces add the infrastructure tests:
 
 ```bash
-HPK_TEST_TURN_URL='turn:127.0.0.1:3478?transport=udp' \
-HPK_TEST_TURN_SECRET='hole-punchky-integration-secret' \
-cargo test -p hole-punchky-client forced_turn_path_relays_data_channel -- --ignored
+HPK_RELAY_AUTH_SECRET="$(openssl rand -hex 32)" ./scripts/container-smoke.sh
+
+sudo env \
+  HPK_BIN="$PWD/target/release/hole-punchky" \
+  HPK_RENDEZVOUS_CONNECT_IP=<reachable-ip> \
+  ./scripts/nat-lab.sh
 ```
 
-See [testing.md](docs/testing.md) for container and network-isolation tests, [operations.md](docs/operations.md) for production deployment, and [threat-model.md](docs/threat-model.md) before exposing a service publicly.
+See [testing.md](docs/testing.md) for exact prerequisites and assertions.
 
 ## Workspace
 
-- `hole-punchky-protocol`: interoperable wire types and cryptography.
-- `hole-punchky-rendezvous`: payload-blind public rendezvous server and binary.
-- `hole-punchky-client`: Pubky resolver and native WebRTC client.
+- `hole-punchky-protocol`: signed discovery/control types and HPKE envelopes.
+- `hole-punchky-rendezvous`: payload-blind consent and relay-admission sidecar.
+- `hole-punchky-client`: Pubky resolver plus native iroh transport.
 - `hole-punchky`: operational CLI.
+- `deploy/iroh-relay.Dockerfile`: checksum-pinned official iroh relay 1.1 binary.
 
 Licensed under the MIT License.

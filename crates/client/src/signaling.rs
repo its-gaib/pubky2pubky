@@ -1,9 +1,13 @@
-use std::{net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use hole_punchky_protocol::{
-    Authenticated, ClientFrame, DeviceCredential, IceServer, Knock, PROTOCOL_VERSION, Registration,
-    Reject, ServerFrame, TurnCredentials, TurnRequest, now_seconds,
+    Authenticated, ClientFrame, DeviceCredential, IROH_TRANSPORT, Knock, PROTOCOL_VERSION,
+    Registration, Reject, ServerFrame, now_seconds,
 };
 use tokio::{
     sync::{Mutex, broadcast, mpsc},
@@ -14,28 +18,36 @@ use tracing::debug;
 use url::Url;
 use uuid::Uuid;
 
-use crate::{ClientError, DescriptorResolver, Result};
+use crate::{
+    ClientError, DescriptorResolver, IrohRelayConfig, PathPolicy, Result, peer::IrohTransport,
+};
 
 /// Connection and negotiation policy for a rendezvous client.
 #[derive(Debug, Clone)]
 pub struct RendezvousClientConfig {
     /// Timeout for the WebSocket handshake and signed registration.
     pub connect_timeout: Duration,
-    /// Overall WebRTC negotiation timeout.
+    /// Overall consent, signaling, and iroh connection timeout.
     pub negotiation_timeout: Duration,
     /// Application heartbeat interval used to keep the outbound NAT mapping alive.
     /// Must be non-zero.
     pub heartbeat_interval: Duration,
-    /// Maximum time to gather each side's ICE candidates.
-    pub ice_gather_timeout: Duration,
-    /// Local UDP bind addresses used by WebRTC.
-    pub udp_bind_addresses: Vec<String>,
-    /// Data-channel label.
-    pub data_channel_label: String,
-    /// Per-channel outstanding send-byte limit.
-    pub send_buffer_limit: usize,
-    /// Try to obtain TURN credentials after peer consent.
-    pub request_turn: bool,
+    /// Time allowed for this endpoint to register with an iroh relay.
+    pub endpoint_online_timeout: Duration,
+    /// Time allowed for each authenticated QUIC handshake phase.
+    pub peer_handshake_timeout: Duration,
+    /// Local UDP bind addresses. At most one address per IP family may be supplied.
+    pub udp_bind_addresses: Vec<SocketAddr>,
+    /// Trusted iroh relays used for NAT discovery and fallback.
+    pub relay_servers: Vec<IrohRelayConfig>,
+    /// Additional DER-encoded CA certificates trusted for relay QUIC address discovery.
+    pub relay_ca_certificates: Vec<Vec<u8>>,
+    /// Permit plain HTTP relay URLs with a loopback hostname for local tests.
+    pub allow_insecure_relay: bool,
+    /// Enable direct paths or force all peer traffic through the relay.
+    pub path_policy: PathPolicy,
+    /// Maximum size of one length-delimited QUIC application message.
+    pub max_message_bytes: usize,
 }
 
 impl Default for RendezvousClientConfig {
@@ -44,11 +56,14 @@ impl Default for RendezvousClientConfig {
             connect_timeout: Duration::from_secs(10),
             negotiation_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(25),
-            ice_gather_timeout: Duration::from_secs(10),
-            udp_bind_addresses: vec!["0.0.0.0:0".to_owned()],
-            data_channel_label: "hole-punchky".to_owned(),
-            send_buffer_limit: 1024 * 1024,
-            request_turn: true,
+            endpoint_online_timeout: Duration::from_secs(15),
+            peer_handshake_timeout: Duration::from_secs(20),
+            udp_bind_addresses: vec![SocketAddr::from(([0, 0, 0, 0], 0))],
+            relay_servers: Vec::new(),
+            relay_ca_certificates: Vec::new(),
+            allow_insecure_relay: false,
+            path_policy: PathPolicy::DirectWithRelayFallback,
+            max_message_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -65,7 +80,7 @@ struct Inner {
     outbound: mpsc::Sender<Outbound>,
     events: broadcast::Sender<WireEvent>,
     incoming: Mutex<mpsc::Receiver<Authenticated<Knock>>>,
-    ice_servers: Vec<IceServer>,
+    transport: IrohTransport,
     connection_id: Uuid,
     task: JoinHandle<()>,
 }
@@ -153,6 +168,23 @@ impl RendezvousClient {
                 "heartbeat interval must be non-zero".to_owned(),
             ));
         }
+        if config.max_message_bytes == 0 || config.max_message_bytes > u32::MAX as usize {
+            return Err(ClientError::Iroh(
+                "maximum peer message size must fit a non-zero u32".to_owned(),
+            ));
+        }
+        if config.relay_servers.len() > 8 {
+            return Err(ClientError::Iroh(
+                "at most eight iroh relays may be configured".to_owned(),
+            ));
+        }
+        if config.path_policy == PathPolicy::DirectWithRelayFallback
+            && config.udp_bind_addresses.is_empty()
+        {
+            return Err(ClientError::Iroh(
+                "direct path policy requires a UDP bind address".to_owned(),
+            ));
+        }
         credential
             .certificate
             .verify(now_seconds(), Some("rendezvous"))?;
@@ -181,12 +213,12 @@ impl RendezvousClient {
             .ok_or_else(|| ClientError::RendezvousClosed("closed during registration".to_owned()))?
             .map_err(|error| ClientError::Rendezvous(error.to_string()))?;
         let frame = decode_server(first)?;
-        let (connection_id, ice_servers) = match frame {
+        let connection_id = match frame {
             ServerFrame::Registered {
                 connection_id,
-                ice_servers,
+                transport,
                 ..
-            } => (connection_id, ice_servers),
+            } if transport == IROH_TRANSPORT => connection_id,
             ServerFrame::Error {
                 code,
                 message,
@@ -198,12 +230,19 @@ impl RendezvousClient {
                     session_id,
                 });
             }
+            ServerFrame::Registered { .. } => {
+                return Err(ClientError::Rendezvous(
+                    "rendezvous selected an unsupported data transport".to_owned(),
+                ));
+            }
             _ => {
                 return Err(ClientError::Rendezvous(
                     "expected registration response".to_owned(),
                 ));
             }
         };
+
+        let transport = IrohTransport::bind(&credential, &config).await?;
 
         let (mut sink, mut stream) = socket.split();
         let (outbound, mut outbound_rx) = mpsc::channel::<Outbound>(128);
@@ -278,7 +317,7 @@ impl RendezvousClient {
                 outbound,
                 events,
                 incoming: Mutex::new(incoming),
-                ice_servers,
+                transport,
                 connection_id,
                 task,
             }),
@@ -295,6 +334,20 @@ impl RendezvousClient {
     #[must_use]
     pub fn identity(&self) -> &str {
         self.inner.credential.identity()
+    }
+
+    /// Dedicated iroh endpoint id certified for this device.
+    #[must_use]
+    pub fn iroh_endpoint_id(&self) -> &str {
+        self.inner.credential.iroh_endpoint_id()
+    }
+
+    /// Gracefully close this client's shared iroh endpoint and stop rendezvous I/O.
+    ///
+    /// All clones of this client and peers using its endpoint are affected.
+    pub async fn close(&self) {
+        self.inner.transport.close().await;
+        self.inner.task.abort();
     }
 
     /// Wait for the next valid knock targeting this identity/device.
@@ -373,61 +426,8 @@ impl RendezvousClient {
         &self.inner.config
     }
 
-    pub(crate) fn public_ice_servers(&self) -> &[IceServer] {
-        &self.inner.ice_servers
-    }
-
-    pub(crate) async fn request_turn(
-        &self,
-        session_id: Uuid,
-        events: &mut broadcast::Receiver<WireEvent>,
-    ) -> Result<Option<TurnCredentials>> {
-        let now = now_seconds();
-        let request = Authenticated::sign(
-            TurnRequest {
-                version: PROTOCOL_VERSION,
-                identity: self.inner.credential.identity().to_owned(),
-                device_id: self.inner.credential.device_id().to_owned(),
-                session_id,
-                issued_at: now,
-                expires_at: now + 30,
-            },
-            &self.inner.credential,
-        )?;
-        self.send(ClientFrame::RequestTurnCredentials(request))
-            .await?;
-        loop {
-            match events.recv().await {
-                Ok(WireEvent::Frame(frame)) => match *frame {
-                    ServerFrame::TurnCredentials(credentials)
-                        if credentials.session_id == session_id =>
-                    {
-                        return Ok(Some(credentials));
-                    }
-                    ServerFrame::Error {
-                        code: hole_punchky_protocol::ErrorCode::TurnUnavailable,
-                        session_id: Some(id),
-                        ..
-                    } if id == session_id => return Ok(None),
-                    ServerFrame::Error {
-                        code,
-                        message,
-                        session_id: related,
-                    } if related == Some(session_id) => {
-                        return Err(ClientError::Server {
-                            code,
-                            message,
-                            session_id: related,
-                        });
-                    }
-                    _ => {}
-                },
-                Ok(WireEvent::Closed(reason)) => {
-                    return Err(ClientError::RendezvousClosed(reason));
-                }
-                Err(error) => return Err(ClientError::RendezvousClosed(error.to_string())),
-            }
-        }
+    pub(crate) fn transport(&self) -> &IrohTransport {
+        &self.inner.transport
     }
 }
 

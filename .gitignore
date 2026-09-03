@@ -1,6 +1,7 @@
 /target/
 /node_modules/
 /.env
+/deploy/.env
 *.key.json
 *.pem
 *.log

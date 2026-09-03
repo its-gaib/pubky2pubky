@@ -12,14 +12,15 @@ use anyhow::{Context as _, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Parser, Subcommand};
 use hole_punchky_client::{
-    DialOptions, IcePolicy, PubkyResolver, RendezvousClient, RendezvousClientConfig,
-    publish_descriptor, resolve_rendezvous_url,
+    ConnectionPath, DialOptions, IrohRelayConfig, PathPolicy, Peer, PubkyResolver,
+    RendezvousClient, RendezvousClientConfig, publish_descriptor, resolve_rendezvous_url,
 };
 use hole_punchky_protocol::{
     DESCRIPTOR_PATH, DeviceCredential, RendezvousDescriptor, RendezvousEndpoint, now_seconds,
 };
 use hole_punchky_rendezvous::{ServerConfig, serve};
 use pubky::{ClientId, Keypair, Pubky, PublicKey};
+use rustls_pki_types::{CertificateDer, pem::PemObject as _};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -51,7 +52,7 @@ enum Command {
     Signup(SignupArgs),
     /// Run the public rendezvous service.
     Serve(ServeArgs),
-    /// Listen for knocks and optionally echo accepted `DataChannel` messages.
+    /// Listen for knocks and optionally echo accepted QUIC messages.
     Listen(ListenArgs),
     /// Dial a peer and send one test message.
     Dial(DialArgs),
@@ -161,15 +162,36 @@ struct ServeArgs {
     /// HTTP/WebSocket listen address.
     #[arg(long, default_value = "0.0.0.0:8080")]
     bind: SocketAddr,
-    /// STUN URLs advertised after registration.
+    /// Secret authenticating calls from the co-located iroh relay.
+    #[arg(long, env = "HPK_RELAY_AUTH_SECRET", hide_env_values = true)]
+    relay_auth_secret: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct TransportArgs {
+    /// Self-hosted iroh relay URL; repeat for redundancy.
+    #[arg(
+        long = "iroh-relay",
+        env = "HPK_IROH_RELAY_URLS",
+        value_delimiter = ','
+    )]
+    iroh_relays: Vec<Url>,
+    /// Optional bearer token accepted by every configured relay.
+    #[arg(long, env = "HPK_IROH_RELAY_TOKEN", hide_env_values = true)]
+    relay_token: Option<String>,
+    /// PEM file containing an additional CA trusted for relay address discovery; repeat as needed.
+    #[arg(
+        long = "iroh-relay-ca",
+        env = "HPK_IROH_RELAY_CA_FILES",
+        value_delimiter = ','
+    )]
+    relay_ca_files: Vec<PathBuf>,
+    /// Permit `<http://localhost>` iroh relays for local development.
     #[arg(long)]
-    stun: Vec<String>,
-    /// TURN URLs supplied after session consent.
+    allow_insecure_relay: bool,
+    /// Disable direct UDP paths and force iroh relay transport.
     #[arg(long)]
-    turn: Vec<String>,
-    /// Coturn static authentication secret.
-    #[arg(long, env = "HPK_TURN_SHARED_SECRET", hide_env_values = true)]
-    turn_shared_secret: Option<String>,
+    relay_only: bool,
 }
 
 #[derive(Debug, Args)]
@@ -193,9 +215,8 @@ struct ListenArgs {
     /// Exit after handling one knock.
     #[arg(long)]
     once: bool,
-    /// Force TURN-only ICE.
-    #[arg(long)]
-    relay_only: bool,
+    #[command(flatten)]
+    transport: TransportArgs,
 }
 
 #[derive(Debug, Args)]
@@ -218,9 +239,8 @@ struct DialArgs {
     /// Use the SDK's local testnet for discovery.
     #[arg(long)]
     testnet: bool,
-    /// Force TURN-only ICE.
-    #[arg(long)]
-    relay_only: bool,
+    #[command(flatten)]
+    transport: TransportArgs,
     /// Do not wait for an echo/response.
     #[arg(long)]
     no_response: bool,
@@ -352,21 +372,12 @@ async fn signup(args: SignupArgs) -> Result<()> {
 }
 
 async fn run_server(args: ServeArgs) -> Result<()> {
-    if args.turn_shared_secret.is_some() == args.turn.is_empty() {
-        bail!("--turn and --turn-shared-secret must be configured together");
-    }
-    if args
-        .turn_shared_secret
-        .as_deref()
-        .is_some_and(|secret| secret.trim().is_empty())
-    {
-        bail!("--turn-shared-secret must not be empty");
+    if args.relay_auth_secret.as_deref().is_some_and(str::is_empty) {
+        bail!("--relay-auth-secret must not be empty");
     }
     serve(ServerConfig {
         bind: args.bind,
-        stun_urls: args.stun,
-        turn_urls: args.turn,
-        turn_shared_secret: args.turn_shared_secret,
+        relay_auth_secret: args.relay_auth_secret,
         ..ServerConfig::default()
     })
     .await
@@ -374,12 +385,8 @@ async fn run_server(args: ServeArgs) -> Result<()> {
 
 async fn listen(args: ListenArgs) -> Result<()> {
     let credential: DeviceCredential = read_secret_json(&args.device)?;
-    let client = RendezvousClient::connect(
-        args.rendezvous,
-        credential,
-        RendezvousClientConfig::default(),
-    )
-    .await?;
+    let client_config = transport_config(&args.transport)?;
+    let client = RendezvousClient::connect(args.rendezvous, credential, client_config).await?;
     println!("listening identity={}", client.identity());
     loop {
         let knock = client.next_knock().await?;
@@ -390,15 +397,18 @@ async fn listen(args: ListenArgs) -> Result<()> {
             knock.knock().application
         );
         if args.accept {
-            let policy = ice_policy(args.relay_only);
-            let peer = client.accept(knock, policy).await?;
-            println!("connected path={:?}", peer.path().await);
+            let peer = client.accept(knock).await?;
+            println!(
+                "connected path={:?}",
+                reported_path(&peer, args.transport.relay_only).await
+            );
             if args.echo {
                 loop {
                     let bytes = peer.recv().await?;
                     if bytes == CLOSE_MARKER {
                         peer.send(CLOSE_ACK).await?;
-                        peer.flush(Duration::from_secs(5)).await?;
+                        peer.finish(Duration::from_secs(5)).await?;
+                        peer.wait_for_peer_finish(Duration::from_secs(5)).await?;
                         break;
                     }
                     peer.send(&bytes).await?;
@@ -415,35 +425,33 @@ async fn listen(args: ListenArgs) -> Result<()> {
             break;
         }
     }
+    client.close().await;
     Ok(())
 }
 
 async fn dial(args: DialArgs) -> Result<()> {
     let credential: DeviceCredential = read_secret_json(&args.device)?;
+    let client_config = transport_config(&args.transport)?;
     let client = if let Some(url) = args.rendezvous {
-        RendezvousClient::connect(url, credential, RendezvousClientConfig::default()).await?
+        RendezvousClient::connect(url, credential, client_config.clone()).await?
     } else {
         let resolver =
             PubkyResolver::new(pubky_client(args.testnet)?).allow_insecure_local(args.testnet);
-        RendezvousClient::connect_resolved(
-            &resolver,
-            &args.peer,
-            credential,
-            RendezvousClientConfig::default(),
-        )
-        .await?
+        RendezvousClient::connect_resolved(&resolver, &args.peer, credential, client_config).await?
     };
     let peer = client
         .dial(
             &args.peer,
             DialOptions {
                 application: args.application,
-                ice_policy: ice_policy(args.relay_only),
                 ..DialOptions::default()
             },
         )
         .await?;
-    println!("connected path={:?}", peer.path().await);
+    println!(
+        "connected path={:?}",
+        reported_path(&peer, args.transport.relay_only).await
+    );
     peer.send_text(&args.message).await?;
     if !args.no_response {
         let response = tokio::time::timeout(Duration::from_secs(15), peer.recv())
@@ -457,9 +465,11 @@ async fn dial(args: DialArgs) -> Result<()> {
         if acknowledgement != CLOSE_ACK {
             bail!("peer returned an invalid close acknowledgement");
         }
-        peer.flush(Duration::from_secs(5)).await?;
+        peer.finish(Duration::from_secs(5)).await?;
+        peer.wait_for_peer_finish(Duration::from_secs(5)).await?;
     }
     peer.close().await?;
+    client.close().await;
     Ok(())
 }
 
@@ -550,10 +560,66 @@ fn pubky_client(testnet: bool) -> Result<Pubky> {
     }
 }
 
-const fn ice_policy(relay_only: bool) -> IcePolicy {
-    if relay_only {
-        IcePolicy::RelayOnly
-    } else {
-        IcePolicy::DirectWithRelayFallback
+fn transport_config(args: &TransportArgs) -> Result<RendezvousClientConfig> {
+    if args.relay_token.as_deref().is_some_and(str::is_empty) {
+        bail!("--relay-token must not be empty");
     }
+    if args.relay_token.is_some() && args.iroh_relays.is_empty() {
+        bail!("--relay-token requires at least one --iroh-relay");
+    }
+    if !args.relay_ca_files.is_empty() && args.iroh_relays.is_empty() {
+        bail!("--iroh-relay-ca requires at least one --iroh-relay");
+    }
+    let relay_servers = args
+        .iroh_relays
+        .iter()
+        .cloned()
+        .map(|url| {
+            let relay = IrohRelayConfig::new(url);
+            args.relay_token
+                .as_ref()
+                .map_or(relay.clone(), |token| relay.with_auth_token(token.as_str()))
+        })
+        .collect();
+    Ok(RendezvousClientConfig {
+        relay_servers,
+        relay_ca_certificates: read_relay_ca_certificates(&args.relay_ca_files)?,
+        allow_insecure_relay: args.allow_insecure_relay,
+        path_policy: if args.relay_only {
+            PathPolicy::RelayOnly
+        } else {
+            PathPolicy::DirectWithRelayFallback
+        },
+        ..RendezvousClientConfig::default()
+    })
+}
+
+fn read_relay_ca_certificates(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
+    let mut certificates = Vec::new();
+    for path in paths {
+        let original_len = certificates.len();
+        let pem_blocks = CertificateDer::pem_file_iter(path)
+            .with_context(|| format!("opening relay CA file {}", path.display()))?;
+        for certificate in pem_blocks {
+            let certificate =
+                certificate.with_context(|| format!("reading relay CA file {}", path.display()))?;
+            certificates.push(certificate.as_ref().to_vec());
+        }
+        if certificates.len() == original_len {
+            bail!(
+                "relay CA file {} contains no CERTIFICATE PEM block",
+                path.display()
+            );
+        }
+    }
+    Ok(certificates)
+}
+
+async fn reported_path(peer: &Peer, relay_only: bool) -> ConnectionPath {
+    let preferred = if relay_only {
+        ConnectionPath::Relayed
+    } else {
+        ConnectionPath::Direct
+    };
+    peer.wait_for_path(preferred, Duration::from_secs(5)).await
 }

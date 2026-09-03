@@ -1,0 +1,12 @@
+http_bind_addr = "0.0.0.0:3340"
+enable_quic_addr_discovery = true
+
+[tls]
+quic_bind_addr = "0.0.0.0:7842"
+hostname = ["localhost"]
+cert_mode = "Manual"
+manual_cert_path = "/etc/iroh-relay/relay.crt"
+manual_key_path = "/etc/iroh-relay/relay.key"
+
+[access.http]
+url = "http://rendezvous:8080/internal/relay/authorize"

@@ -1,9 +1,9 @@
 asyncapi: 3.1.0
 info:
   title: Hole Punchky rendezvous WebSocket
-  version: 1.0.0
+  version: 2.0.0
   description: >-
-    Consent-first, authenticated routing for end-to-end encrypted WebRTC signaling.
+    Consent-first, authenticated routing for an HPKE-encrypted iroh endpoint address.
     Cryptographic construction and state ordering are normative in protocol.md.
   license:
     name: MIT
@@ -11,11 +11,11 @@ info:
 servers:
   production:
     host: connect.example.com
-    pathname: /v1/ws
+    pathname: /v2/ws
     protocol: wss
 channels:
   rendezvous:
-    address: /v1/ws
+    address: /v2/ws
     messages:
       clientFrame: { $ref: "#/components/messages/ClientFrame" }
       serverFrame: { $ref: "#/components/messages/ServerFrame" }
@@ -33,11 +33,9 @@ operations:
 components:
   messages:
     ClientFrame:
-      payload:
-        $ref: "#/components/schemas/ClientFrame"
+      payload: { $ref: "#/components/schemas/ClientFrame" }
     ServerFrame:
-      payload:
-        $ref: "#/components/schemas/ServerFrame"
+      payload: { $ref: "#/components/schemas/ServerFrame" }
   schemas:
     ClientFrame:
       oneOf:
@@ -46,7 +44,6 @@ components:
         - $ref: "#/components/schemas/AcceptFrame"
         - $ref: "#/components/schemas/RejectFrame"
         - $ref: "#/components/schemas/SignalFrame"
-        - $ref: "#/components/schemas/TurnRequestFrame"
         - type: object
           required: [type, data]
           properties:
@@ -60,23 +57,20 @@ components:
       required: [type, data]
       properties:
         type:
-          enum: [registered, knock, accepted, rejected, signal, turn_credentials, pong, error]
+          enum: [registered, knock, accepted, rejected, signal, pong, error]
         data: { type: object }
     RegisterFrame:
       $ref: "#/components/schemas/AuthenticatedFrame"
-      description: type is register; payload signing domain is hole-punchky/register/v1.
+      description: type is register; payload signing domain is hole-punchky/register/v2.
     KnockFrame:
       $ref: "#/components/schemas/AuthenticatedFrame"
-      description: type is knock; payload signing domain is hole-punchky/knock/v1.
+      description: type is knock; payload signing domain is hole-punchky/knock/v2.
     AcceptFrame:
       $ref: "#/components/schemas/AuthenticatedFrame"
-      description: type is accept; payload signing domain is hole-punchky/accept/v1.
+      description: type is accept; payload signing domain is hole-punchky/accept/v2.
     RejectFrame:
       $ref: "#/components/schemas/AuthenticatedFrame"
-      description: type is reject; payload signing domain is hole-punchky/reject/v1.
-    TurnRequestFrame:
-      $ref: "#/components/schemas/AuthenticatedFrame"
-      description: type is request_turn_credentials; payload domain is hole-punchky/turn-request/v1.
+      description: type is reject; payload signing domain is hole-punchky/reject/v2.
     AuthenticatedFrame:
       type: object
       required: [type, data]
@@ -95,13 +89,23 @@ components:
       properties:
         claims:
           type: object
-          required: [version, identity, device_id, signing_key, encryption_key, issued_at, expires_at, capabilities]
+          required:
+            - version
+            - identity
+            - device_id
+            - signing_key
+            - encryption_key
+            - iroh_endpoint_id
+            - issued_at
+            - expires_at
+            - capabilities
           properties:
-            version: { const: 1 }
+            version: { const: 2 }
             identity: { $ref: "#/components/schemas/PubkyIdentity" }
             device_id: { type: string, minLength: 1, maxLength: 128 }
             signing_key: { $ref: "#/components/schemas/PubkyIdentity" }
             encryption_key: { $ref: "#/components/schemas/Base64Url" }
+            iroh_endpoint_id: { $ref: "#/components/schemas/PubkyIdentity" }
             issued_at: { type: integer, minimum: 0 }
             expires_at: { type: integer, minimum: 1 }
             capabilities:
@@ -119,22 +123,46 @@ components:
           properties:
             header:
               type: object
-              required: [version, session_id, from_identity, from_device_id, to_identity, to_device_id, sequence, kind, issued_at, expires_at]
+              required:
+                - version
+                - session_id
+                - from_identity
+                - from_device_id
+                - to_identity
+                - to_device_id
+                - sequence
+                - kind
+                - issued_at
+                - expires_at
               properties:
-                version: { const: 1 }
+                version: { const: 2 }
                 session_id: { type: string, format: uuid }
                 from_identity: { $ref: "#/components/schemas/PubkyIdentity" }
                 from_device_id: { type: string }
                 to_identity: { $ref: "#/components/schemas/PubkyIdentity" }
                 to_device_id: { type: string }
-                sequence: { type: integer, minimum: 0 }
-                kind: { enum: [offer, answer, candidate, end_of_candidates, abort] }
+                sequence: { const: 0 }
+                kind: { enum: [iroh_endpoint, abort] }
                 issued_at: { type: integer, minimum: 0 }
                 expires_at: { type: integer, minimum: 1 }
             certificate: { $ref: "#/components/schemas/DeviceCertificate" }
             encapsulated_key: { $ref: "#/components/schemas/Base64Url" }
             ciphertext: { $ref: "#/components/schemas/Base64Url" }
             signature: { $ref: "#/components/schemas/Base64Url" }
+    IrohEndpointAddressPlaintext:
+      description: This object appears only inside the HPKE ciphertext after target consent.
+      type: object
+      required: [endpoint_id, relay_urls, direct_addresses]
+      properties:
+        endpoint_id: { $ref: "#/components/schemas/PubkyIdentity" }
+        relay_urls:
+          type: array
+          maxItems: 8
+          items: { type: string, format: uri }
+        direct_addresses:
+          type: array
+          maxItems: 32
+          items: { type: string }
     PubkyIdentity:
       type: string
       pattern: "^[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$"

@@ -1,8 +1,10 @@
 openapi: 3.1.0
 info:
-  title: Hole Punchky rendezvous HTTP surface
+  title: Hole Punchky v2 rendezvous HTTP surface
   version: 2.0.0
-  description: The signaling protocol on /v2/ws is specified in asyncapi.yaml.
+  description: >-
+    The v2 signaling protocol on /v2/ws is specified in asyncapi.yaml. Protocol v3 does not
+    expose a rendezvous HTTP or WebSocket service.
   license:
     name: MIT
     identifier: MIT

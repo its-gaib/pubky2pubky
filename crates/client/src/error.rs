@@ -41,6 +41,9 @@ pub enum ClientError {
     /// Pubky storage or discovery failed.
     #[error("Pubky discovery failed: {0}")]
     Discovery(String),
+    /// Persistent anti-rollback state could not be validated or updated.
+    #[error("anti-rollback state failed: {0}")]
+    State(String),
     /// Iroh endpoint, relay, QUIC, or stream operation failed.
     #[error("iroh transport failed: {0}")]
     Iroh(String),

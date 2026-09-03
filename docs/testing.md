@@ -1,5 +1,43 @@
 # Testing strategy
 
+## Protocol v3 release gate
+
+V3 is additive; its tests do not replace the v2 gates below. Before calling v3 production-ready,
+the automated and manual evidence must cover:
+
+- root-signed directory and device-signed locator canonicalization, binding, expiry, maximum
+  lifetimes, exact v3 paths/domains/ALPN, and key separation;
+- rejection of tampering, an identity or endpoint substitution, unknown/removed devices, stale
+  directory generations, stale per-device locator sequences, instance replay, and v2/v3
+  cross-protocol inputs;
+- exact trusted-relay enforcement before DNS or connection side effects, including credentials,
+  ports, redirects, loopback/private/link-local targets, and development-only HTTP policy;
+- durable sequence continuity across listener restart and multiple devices publishing without
+  overwriting one another;
+- real Pubky testnet signup and publication where A starts with only B's Pubky ID, resolves B
+  through PKARR/homeserver, and obtains an authenticated exact message echo;
+- real iroh relay fallback with UDP blocked and direct migration between native clients behind two
+  independent NATs where the topology permits it;
+- endpoint-ID verification plus relay/homeserver evidence that the synthetic payload stays inside
+  the same end-to-end encrypted iroh QUIC stream before and after path migration, with no plaintext
+  fallback;
+- bounded rejection of unsolicited connections, bad/replayed/oversized hellos, wrong remote QUIC
+  endpoint IDs, slow peers, and concurrency exhaustion;
+- proof that the reference client never sends 0-RTT, reported early streams are rejected, signed
+  Hello replay checks cover hostile encrypted early input, and no application payload is surfaced
+  or processed before authentication and receiver acceptance;
+- path reporting that identifies browser/Wasm connections as relay-only.
+
+Packet evidence must distinguish “QUIC connected through a relay” from “migrated to a direct
+path.” Capture only synthetic payloads because Pubky/device IDs, network addresses, and timing are
+sensitive. Do not claim that a loopback or single-host test proves NAT traversal.
+
+Run the CLI help/parse tests as well as the workspace tests so the explicit public-contact
+acknowledgment and offline-root/online-device workflow cannot drift from the library API. Assert
+that fresh v3 commands reject plaintext `--relay-token` and `--message` arguments: the token is
+environment-only and the bounded UTF-8 test message is read from stdin after locator publication
+is confirmed. Verify that peer-controlled response bytes are terminal-escaped.
+
 ## Always-on gates
 
 Run the complete repository gate before every commit:

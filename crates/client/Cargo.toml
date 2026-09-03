@@ -9,7 +9,9 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
 futures-util.workspace = true
+fs2 = "0.4"
 hole-punchky-protocol = { path = "../protocol" }
 iroh.workspace = true
 n0-watcher.workspace = true
@@ -22,6 +24,9 @@ tokio-tungstenite.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 hole-punchky-rendezvous = { path = "../rendezvous" }

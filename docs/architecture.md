@@ -1,6 +1,11 @@
 # Architecture and homeserver integration
 
-## Decision
+This document specifies the deployed protocol v2 architecture. Protocol v3 is additive and removes
+the custom rendezvous in favor of root-authorized device records and short-lived signed iroh
+locators in Pubky public storage. See [v3.md](v3.md). Neither version requires a homeserver fork,
+and clients must not silently downgrade between them.
+
+## V2 decision
 
 Use Pubky as the control and identity plane and iroh as the native data plane. Do not fork `pubky-homeserver` for protocol v2.
 

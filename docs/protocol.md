@@ -2,6 +2,9 @@
 
 This document is normative for v2. The Rust types in `hole-punchky-protocol` and the state machine in `hole-punchky-rendezvous` are the executable reference implementation.
 
+Protocol v3 has separate storage paths, signing domains, credentials, and QUIC ALPN and is
+documented in [v3.md](v3.md). A v3 failure must never trigger implicit v2 fallback.
+
 ## Conventions
 
 - Identity and endpoint strings are bare, canonical 52-character z-base-32 Ed25519 public keys.

@@ -137,7 +137,7 @@ impl std::fmt::Debug for Peer {
 }
 
 impl Peer {
-    fn new(
+    pub(crate) fn new(
         connection: Connection,
         send: SendStream,
         recv: RecvStream,

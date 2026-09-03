@@ -1,10 +1,11 @@
 asyncapi: 3.1.0
 info:
-  title: Hole Punchky rendezvous WebSocket
+  title: Hole Punchky v2 rendezvous WebSocket
   version: 2.0.0
   description: >-
-    Consent-first, authenticated routing for an HPKE-encrypted iroh endpoint address.
-    Cryptographic construction and state ordering are normative in protocol.md.
+    Protocol v2 consent-first, authenticated routing for an HPKE-encrypted iroh endpoint
+    address. Protocol v3 does not use this service. Cryptographic construction and state
+    ordering are normative in protocol.md.
   license:
     name: MIT
     url: https://opensource.org/license/mit

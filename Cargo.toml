@@ -12,7 +12,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
-repository = "https://github.com/its-gaib/hole-punchky"
+repository = "https://github.com/its-gaib/pubky2pubky"
 
 [workspace.dependencies]
 anyhow = "1.0"

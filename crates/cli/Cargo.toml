@@ -1,6 +1,6 @@
 [package]
 name = "hole-punchky"
-description = "Hole Punchky command-line interface"
+description = "pubky2pubky command-line interface"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -22,6 +22,9 @@ tokio.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

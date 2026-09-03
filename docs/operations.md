@@ -1,6 +1,79 @@
 # Operations
 
-## Production topology
+## Protocol v3 topology
+
+V3 uses the unmodified Pubky homeserver and an official iroh relay. It has no pubky2pubky
+rendezvous service or relay-admission callback:
+
+```text
+PKARR -> Pubky homeserver -> /pub/pubky2pubky/v3/directory.json
+                           -> /pub/pubky2pubky/v3/locators/<device-control-key>.json
+
+relay.example.com:443      -> TLS proxy -> iroh-relay:3340
+relay.example.com:7842/udp             -> iroh-relay QUIC address discovery
+```
+
+The checked-in Docker Compose topology is the compatibility v2 deployment: its relay calls the v2
+rendezvous presence endpoint and will reject a v3-only device. Do not use that admission callback
+for v3. Configure a v3 relay with the official relay's shared-token or explicit endpoint-allowlist
+policy, or operate a separate bounded authorization service designed for v3. Relay bearer tokens
+are local client configuration and must never appear in Pubky locators, logs, command history, or
+frontend bundles.
+
+For the v3 probe CLI, inject an optional bearer token only through the
+`PUBKY2PUBKY_IROH_RELAY_TOKEN` environment variable. V3 deliberately exposes no plaintext token
+argument. The CLI bounds and validates the value, zeroizes its temporary validation buffer, and
+does not log it; the transport retains only the copy needed for authenticated relay requests. A
+production service should obtain the same local-only value from its secret manager and avoid
+exposing its process environment to unrelated users or diagnostics.
+
+The device directory is root-signed and changes only when issuing, replacing, or retiring a
+device. Each listener signs short-lived locator updates using its delegated online key. Run root
+signing offline. A listener must never receive the Pubky recovery phrase or root secret.
+
+Publication is a separate authority boundary. Library integrations pass an already-authorized,
+least-privilege `PubkySession` to the publish functions. The file-backed CLI's short-lived
+publisher signs in with a development root file, writes the already-signed object, and exits; do
+not copy that shortcut into a listener service. Scope the session to the v3 public-storage prefix
+when the account/auth layer supports scoped capabilities.
+
+Persist the next directory generation and each device's next locator sequence atomically. Back up
+that small state with the device credential. A crash or restore must not reset either counter.
+Publish locator updates before the old locator expires and whenever the selected home relay
+changes. Letting a locator expire is the clean offline signal; it does not queue messages.
+
+Treat loss differently for the two counters. A device that loses its locator publisher state must
+be removed and reissued with a new control key; never restart its old key at sequence one.
+Directory generation belongs to the offline root procedure. Record it before publication and keep
+independent backups; if no trustworthy last generation can be recovered, migrate the Pubky
+identity instead of guessing a lower value.
+
+Configure every client with an exact trusted-relay allowlist. The relay URL is attacker-controlled
+input even after the target signs it: the signature authenticates the target's choice, not the
+safety of connecting from the caller's network. Production policy should permit only normalized
+HTTPS origins operated or explicitly trusted by the application, reject off-allowlist redirects
+and unsafe DNS results, and fail closed when no advertised relay is allowed.
+
+Monitor locator publication age, expiry margin, sequence rollback rejections, directory generation
+rollback rejections, QUIC authentication failures, unsolicited inbound handshakes, relay health,
+relay traffic, and observed direct-versus-relayed paths. Apply per-source and per-identity
+connection/hello limits at the listener because v3 has no pre-QUIC consent gate.
+
+After authenticating a signed Hello, the listener surfaces an `IncomingV3` request. The application
+must make an explicit bounded accept/reject decision. Only acceptance sends the signed Ack and
+exposes the `Peer` to application payload handlers; dropping or rejecting the request closes it.
+Bounded encrypted transport input can be buffered before the decision, but is not surfaced or
+processed as application payload. This content gate does not undo the earlier network contact or
+address disclosure.
+
+Native clients need outbound TCP 443 for relay fallback and outbound UDP for direct QUIC. A public
+locator lets arbitrary readers probe liveness and initiate iroh; direct-capable iroh may expose
+address candidates before application authentication. The reference native v3 client currently
+provides direct-with-relay-fallback only; it does not expose a peer-address-hiding relay-only
+policy. Do not publish a privacy-sensitive identity until that mode exists, or retain v2's consent
+service. Browser/Wasm iroh is relay-only today and must never be reported as a direct path.
+
+## Protocol v2 production topology
 
 Run the unmodified Pubky homeserver, Hole Punchky rendezvous, and official iroh relay as separate services. They may share a host and reverse proxy, but they do not share a database or signing key.
 
@@ -17,7 +90,7 @@ The relay-to-rendezvous callback stays on the private container network. The exa
 
 Clients need outbound TCP 443 for WSS and relay fallback plus outbound UDP for direct QUIC. No fixed inbound client port is required. A network that blocks UDP should continue over the TLS relay path.
 
-## Deployment checklist
+## V2 deployment checklist
 
 1. Create DNS records for separate rendezvous and relay names. Terminate valid public TLS for both; clients require `wss://` and `https://` outside explicit loopback development mode. Expose the relay's standard UDP 7842 QUIC address-discovery port alongside its HTTPS/relay port.
 2. Copy `deploy/.env.example` to `deploy/.env` and generate `HPK_RELAY_AUTH_SECRET` with at least 32 random bytes. This secret is machine-to-machine authentication, not a client credential.
@@ -35,7 +108,7 @@ Clients need outbound TCP 443 for WSS and relay fallback plus outbound UDP for d
 
 The supplied iroh image downloads the official v1.1.0 release archive and verifies its architecture-specific SHA-256 checksum. Review and update the version and checksum together. The rendezvous image builds with the locked Cargo graph.
 
-## Relay admission
+## V2 relay admission
 
 The relay performs an HTTP authorization call for every connecting endpoint. It includes its observed endpoint ID and the shared bearer secret. The rendezvous returns exactly `200 true` only when that endpoint ID appears in a successfully authenticated WebSocket registration.
 
@@ -47,7 +120,7 @@ Rotate `HPK_RELAY_AUTH_SECRET` by updating rendezvous and relay in one maintenan
 
 The client library can alternatively attach a relay bearer token through `IrohRelayConfig::with_auth_token`; the CLI exposes `--relay-token`. That mode is useful with the official relay's shared-token policy but is separate from the supplied presence-based HTTP policy.
 
-## Rendezvous configuration
+## V2 rendezvous configuration
 
 | Variable | Default | Meaning |
 | --- | --- | --- |

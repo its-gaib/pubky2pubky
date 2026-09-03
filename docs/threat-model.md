@@ -1,5 +1,41 @@
 # Threat model
 
+## Protocol v3 security delta
+
+The remainder of this document is the complete protocol v2 threat model. Protocol v3 keeps Pubky
+root-to-device delegation and iroh QUIC authentication but removes the consent rendezvous and HPKE
+address release. Its additional and changed assumptions are:
+
+- The public homeserver directory exposes device IDs, delegated signing keys, stable iroh endpoint
+  IDs, authorization lifetimes, and directory generation. Per-device locators additionally expose
+  selected relay operators, update timing, instance nonces, sequence numbers, and expiry.
+- Any reader can attempt QUIC and test apparent liveness. Iroh's direct-path negotiation may reveal
+  public, carrier, VPN, or local-interface address candidates to an untrusted peer before the
+  application authenticates or accepts message content. Direct-capable dialing therefore requires
+  an explicit public-contact disclosure acknowledgment. Relay-only mode trades directness for peer
+  address privacy but still exposes both endpoints and traffic metadata to the relay.
+- A signed relay URL is still attacker-controlled egress configuration. Dialers require a local,
+  exact trusted-relay allowlist and fail closed; signature verification must never authorize an
+  otherwise unsafe URL, redirect, or DNS result.
+- The homeserver can replay signed data. Short expiry bounds the window, while persistent minimum
+  directory generations and per-device locator sequences prevent rollback after a client has seen
+  newer state. A fresh client with no prior state remains vulnerable to replay within the signed
+  validity window.
+- Compromising a delegated device permits signed locator refresh and iroh authentication until the
+  device authorization expires or a newer directory removing it is observed. The root remains
+  offline and is not needed by a listener. Compromising a homeserver session permits storage
+  deletion or replacement but not forgery; publication credentials should be least-privilege and
+  isolated from device and root secrets.
+- Unknown callers can consume relay, QUIC handshake, CPU, socket, and application-hello capacity
+  without first passing consent. Listeners need bounded handshakes, frame sizes, timeouts,
+  concurrency, per-source/per-identity limits, and application authorization after cryptographic
+  authentication.
+- V3 has no offline delivery or guaranteed direct path. Native peers may migrate to direct UDP or
+  remain on the encrypted relay. Current browser/Wasm iroh transport is relay-only.
+
+V3 uses separate signing domains, paths, credential version, and ALPN. A failed v3 verification or
+connection must not fall back automatically to v2 or v1. See [v3.md](v3.md) for the full model.
+
 ## Scope and security goals
 
 Hole Punchky v2 aims to provide these properties:

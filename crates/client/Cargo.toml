@@ -1,6 +1,6 @@
 [package]
 name = "hole-punchky-client"
-description = "Native Hole Punchky client"
+description = "Pubky-discovered authenticated iroh client for native and browser v3 peers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,21 +11,29 @@ repository.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 futures-util.workspace = true
-fs2 = "0.4"
 hole-punchky-protocol = { path = "../protocol" }
-iroh.workspace = true
+n0-future.workspace = true
 n0-watcher.workspace = true
 pubky.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
-tokio-tungstenite.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+iroh = { version = "=1.1.0", default-features = false, features = ["tls-ring"] }
+tokio = { version = "1.47", features = ["io-util", "sync"] }
+uuid = { workspace = true, features = ["js"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fs2 = "0.4"
+iroh.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+
+[target.'cfg(all(unix, not(target_arch = "wasm32")))'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

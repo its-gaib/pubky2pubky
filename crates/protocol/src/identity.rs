@@ -1,10 +1,9 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::Signature;
 use hpke::{Deserializable, Kem as _, Serializable, kem::X25519HkdfSha256};
 use pubky_common::crypto::{Keypair, PublicKey};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use web_time::{SystemTime, UNIX_EPOCH};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::{

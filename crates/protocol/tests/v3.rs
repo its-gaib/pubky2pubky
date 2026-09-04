@@ -367,15 +367,16 @@ fn hello_and_ack_bind_every_identity_device_endpoint_application_and_locator() {
     let bob_root = Keypair::random();
     let alice = credential(&alice_root, "alice-phone");
     let bob = credential(&bob_root, "bob-laptop");
+    let alice_locator = locator(&alice, 4);
     let bob_locator = locator(&bob, 9);
     let hello = ok(V3SignedHello::sign(
         &alice,
+        &alice_locator,
         &bob.certificate,
         &bob_locator,
         "chat/1",
         v3_random_nonce(),
-        NOW + 1,
-        NOW + 61,
+        (NOW + 1, NOW + 61),
     ));
 
     assert!(
@@ -391,6 +392,8 @@ fn hello_and_ack_bind_every_identity_device_endpoint_application_and_locator() {
             .is_ok()
     );
     assert_eq!(hello.claims.from_identity, alice.identity());
+    assert_eq!(hello.claims.from_certificate, alice.certificate);
+    assert_eq!(hello.claims.from_locator, alice_locator);
     assert_eq!(hello.claims.to_identity, bob.identity());
     assert_eq!(hello.claims.from_iroh_endpoint_id, alice.iroh_endpoint_id());
     assert_eq!(hello.claims.to_iroh_endpoint_id, bob.iroh_endpoint_id());
@@ -412,6 +415,7 @@ fn hello_and_ack_bind_every_identity_device_endpoint_application_and_locator() {
             &hello,
             "chat/1",
             NOW + 2,
+            false,
         )
         .is_ok()
     );
@@ -430,15 +434,16 @@ fn hello_rejects_tamper_substitution_cross_identity_and_bad_bounds() {
     let alice = credential(&alice_root, "alice");
     let bob = credential(&bob_root, "bob");
     let mallory = credential(&mallory_root, "mallory");
+    let alice_locator = locator(&alice, 1);
     let bob_locator = locator(&bob, 1);
     let hello = ok(V3SignedHello::sign(
         &alice,
+        &alice_locator,
         &bob.certificate,
         &bob_locator,
         "chat/1",
         v3_random_nonce(),
-        NOW,
-        NOW + 60,
+        (NOW, NOW + 60),
     ));
 
     let mut tampered = hello.clone();
@@ -483,24 +488,24 @@ fn hello_rejects_tamper_substitution_cross_identity_and_bad_bounds() {
     assert!(
         V3SignedHello::sign(
             &alice,
+            &alice_locator,
             &bob.certificate,
             &bob_locator,
             "chat/1",
             "short",
-            NOW,
-            NOW + 60,
+            (NOW, NOW + 60),
         )
         .is_err()
     );
     assert!(
         V3SignedHello::sign(
             &alice,
+            &alice_locator,
             &bob.certificate,
             &bob_locator,
             "chat/1",
             v3_random_nonce(),
-            NOW,
-            NOW + V3_MAX_HANDSHAKE_LIFETIME_SECONDS + 1,
+            (NOW, NOW + V3_MAX_HANDSHAKE_LIFETIME_SECONDS + 1),
         )
         .is_err()
     );
@@ -518,6 +523,54 @@ fn hello_rejects_tamper_substitution_cross_identity_and_bad_bounds() {
 }
 
 #[test]
+fn hello_signature_binds_the_exact_embedded_sender_certificate_and_locator() {
+    let alice = credential(&Keypair::random(), "alice");
+    let bob = credential(&Keypair::random(), "bob");
+    let mallory = credential(&Keypair::random(), "mallory");
+    let alice_locator = locator(&alice, 1);
+    let bob_locator = locator(&bob, 1);
+    let hello = ok(V3SignedHello::sign(
+        &alice,
+        &alice_locator,
+        &bob.certificate,
+        &bob_locator,
+        "chat/1",
+        v3_random_nonce(),
+        (NOW, NOW + 60),
+    ));
+
+    let mut certificate_tamper = hello.clone();
+    certificate_tamper.claims.from_certificate = mallory.certificate.clone();
+    assert!(
+        certificate_tamper
+            .verify(
+                &mallory.certificate,
+                &bob.certificate,
+                &bob_locator,
+                "chat/1",
+                NOW,
+                false,
+            )
+            .is_err()
+    );
+
+    let mut locator_tamper = hello;
+    locator_tamper.claims.from_locator = locator(&alice, 2);
+    assert!(
+        locator_tamper
+            .verify(
+                &alice.certificate,
+                &bob.certificate,
+                &bob_locator,
+                "chat/1",
+                NOW,
+                false,
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn ack_rejects_nonce_endpoint_and_hello_substitution() {
     let alice_root = Keypair::random();
     let bob_root = Keypair::random();
@@ -525,15 +578,16 @@ fn ack_rejects_nonce_endpoint_and_hello_substitution() {
     let alice = credential(&alice_root, "alice");
     let bob = credential(&bob_root, "bob");
     let mallory = credential(&mallory_root, "mallory");
+    let alice_locator = locator(&alice, 1);
     let bob_locator = locator(&bob, 1);
     let hello = ok(V3SignedHello::sign(
         &alice,
+        &alice_locator,
         &bob.certificate,
         &bob_locator,
         "chat/1",
         v3_random_nonce(),
-        NOW,
-        NOW + 60,
+        (NOW, NOW + 60),
     ));
 
     assert!(
@@ -566,6 +620,7 @@ fn ack_rejects_nonce_endpoint_and_hello_substitution() {
             &hello,
             "chat/1",
             NOW + 1,
+            false,
         )
         .is_err()
     );

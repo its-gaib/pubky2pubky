@@ -1,34 +1,43 @@
-use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
+use std::time::Duration;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::{collections::HashMap, net::IpAddr, sync::Arc};
 
 use futures_util::StreamExt as _;
+#[cfg(not(target_arch = "wasm32"))]
 use hole_punchky_protocol::{
     Accept, Authenticated, ClientFrame, DeviceCertificate, DeviceCredential, EncryptedSignal,
     IROH_ALPN, IrohEndpointAddress, Knock, PROTOCOL_VERSION, ServerFrame, SignalPayload,
     now_seconds,
 };
+use iroh::endpoint::{Connection, RecvStream, SendStream};
+#[cfg(not(target_arch = "wasm32"))]
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
-    TransportAddr,
-    endpoint::{Connection, RecvStream, SendStream, presets},
-    tls::CaTlsConfig,
+    TransportAddr, endpoint::presets, tls::CaTlsConfig,
 };
+use n0_future::time;
+#[cfg(not(target_arch = "wasm32"))]
 use n0_watcher::Watcher as _;
+#[cfg(not(target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::{io::AsyncWriteExt as _, sync::Mutex};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::{
-    io::AsyncWriteExt as _,
-    sync::{Mutex, broadcast, oneshot},
+    sync::{broadcast, oneshot},
     task::JoinHandle,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use tracing::debug;
 use url::Url;
 use uuid::Uuid;
 
-use crate::{
-    ClientError, IncomingKnock, RendezvousClient, RendezvousClientConfig, Result,
-    signaling::WireEvent,
-};
+use crate::{ClientError, Result};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::{IncomingKnock, RendezvousClient, RendezvousClientConfig, signaling::WireEvent};
 
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
 
 /// Path policy applied to the iroh endpoint.
@@ -245,7 +254,7 @@ impl Peer {
             }
             ConnectionPath::Unknown
         };
-        tokio::time::timeout(timeout, wait)
+        time::timeout(timeout, wait)
             .await
             .unwrap_or_else(|_| self.path())
     }
@@ -258,7 +267,7 @@ impl Peer {
     pub async fn flush(&self, timeout: Duration) -> Result<()> {
         let mut guard = self.send.lock().await;
         let stream = guard.as_mut().ok_or(ClientError::ChannelClosed)?;
-        tokio::time::timeout(timeout, stream.flush())
+        time::timeout(timeout, stream.flush())
             .await
             .map_err(|_| ClientError::Timeout("flushing peer QUIC stream"))?
             .map_err(|error| ClientError::Iroh(error.to_string()))
@@ -280,7 +289,7 @@ impl Peer {
         stream
             .finish()
             .map_err(|error| ClientError::Iroh(error.to_string()))?;
-        match tokio::time::timeout(timeout, stream.stopped()).await {
+        match time::timeout(timeout, stream.stopped()).await {
             Err(_) => Err(ClientError::Timeout("draining peer QUIC stream")),
             Ok(Err(error)) => Err(ClientError::Iroh(error.to_string())),
             Ok(Ok(Some(code))) => Err(ClientError::Iroh(format!(
@@ -303,7 +312,7 @@ impl Peer {
     pub async fn wait_for_peer_finish(&self, timeout: Duration) -> Result<()> {
         let mut stream = self.recv.lock().await;
         let mut trailing = [0u8; 1];
-        match tokio::time::timeout(timeout, stream.read(&mut trailing)).await {
+        match time::timeout(timeout, stream.read(&mut trailing)).await {
             Err(_) => Err(ClientError::Timeout("waiting for peer QUIC stream finish")),
             Ok(Err(error)) => Err(ClientError::Iroh(error.to_string())),
             Ok(Ok(None | Some(0))) => Ok(()),
@@ -350,6 +359,7 @@ fn selected_path(connection: &Connection) -> ConnectionPath {
         })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn has_public_direct_address(address: &EndpointAddr) -> bool {
     address.ip_addrs().any(|candidate| {
         !matches!(
@@ -362,6 +372,7 @@ fn has_public_direct_address(address: &EndpointAddr) -> bool {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Serialize, Deserialize)]
 struct StreamHello {
     version: u16,
@@ -373,12 +384,14 @@ struct StreamHello {
     application: String,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Serialize, Deserialize)]
 struct StreamAck {
     version: u16,
     session_id: Uuid,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct PendingSession {
     remote_endpoint_id: EndpointId,
     remote_identity: String,
@@ -389,20 +402,24 @@ struct PendingSession {
     sender: oneshot::Sender<IncomingPeer>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct IncomingPeer {
     connection: Connection,
     send: SendStream,
     recv: RecvStream,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct AbortTask(JoinHandle<()>);
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for AbortTask {
     fn drop(&mut self) {
         self.0.abort();
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct IrohTransport {
     endpoint: Endpoint,
     pending: Arc<Mutex<HashMap<Uuid, PendingSession>>>,
@@ -411,6 +428,7 @@ pub(crate) struct IrohTransport {
     max_message_bytes: usize,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl IrohTransport {
     pub(crate) async fn bind(
         credential: &DeviceCredential,
@@ -626,6 +644,7 @@ impl IrohTransport {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn handle_incoming(
     incoming: iroh::endpoint::Incoming,
     pending: Arc<Mutex<HashMap<Uuid, PendingSession>>>,
@@ -679,6 +698,7 @@ async fn handle_incoming(
         .map_err(|_| ClientError::ChannelClosed)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn validate_relay_url(url: &Url, allow_insecure: bool) -> Result<()> {
     if url.scheme() == "https" {
         return Ok(());
@@ -689,6 +709,7 @@ pub(crate) fn validate_relay_url(url: &Url, allow_insecure: bool) -> Result<()> 
     Err(ClientError::InvalidRelayUrl)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn relay_url_is_loopback(url: &Url) -> bool {
     url.host_str().is_some_and(|host| {
         host == "localhost"
@@ -698,6 +719,7 @@ fn relay_url_is_loopback(url: &Url) -> bool {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn write_json<T: Serialize>(stream: &mut SendStream, value: &T, max: usize) -> Result<()> {
     let bytes = serde_json::to_vec(value).map_err(|error| ClientError::Iroh(error.to_string()))?;
     if bytes.len() > max {
@@ -708,6 +730,7 @@ async fn write_json<T: Serialize>(stream: &mut SendStream, value: &T, max: usize
     write_bytes(stream, &bytes).await
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn read_json<T: for<'de> Deserialize<'de>>(stream: &mut RecvStream, max: usize) -> Result<T> {
     let bytes = read_bytes(stream, max).await?;
     serde_json::from_slice(&bytes).map_err(|error| ClientError::Iroh(error.to_string()))
@@ -746,6 +769,7 @@ async fn read_bytes(stream: &mut RecvStream, max: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl RendezvousClient {
     /// Knock a Pubky identity, obtain consent, then establish authenticated iroh QUIC.
     ///
@@ -905,6 +929,7 @@ impl RendezvousClient {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn wait_for_accept_and_endpoint(
     client: &RendezvousClient,
     events: &mut broadcast::Receiver<WireEvent>,

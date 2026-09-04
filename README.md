@@ -1,25 +1,29 @@
 # pubky2pubky
 
-pubky2pubky maps a Pubky identity to authenticated native iroh QUIC endpoints. Protocol v3 is an
+pubky2pubky maps a Pubky identity to authenticated iroh QUIC endpoints. Protocol v3 is an
 additive, rendezvous-free design: PKARR locates the identity's unmodified homeserver, public
 storage provides a root-signed device directory and short-lived device-signed relay locators, and
-iroh supplies encrypted relay fallback plus direct UDP hole punching.
+iroh supplies an encrypted relay path plus direct UDP hole punching on native platforms.
 
 ```text
-Pubky ID -> PKARR -> homeserver -> signed v3 directory + locators -> iroh relay -> direct QUIC
+Pubky ID -> PKARR -> homeserver -> signed v3 directory + locators -> iroh QUIC (relay or direct)
 ```
 
 V3 deliberately permits public contact. Reading an identity's public records reveals its device
-and iroh endpoint identifiers and chosen relay; initiating iroh may reveal liveness and network
-address candidates before any application message is accepted. Direct-capable callers must
-explicitly acknowledge that disclosure. The current native v3 API is direct-with-relay-fallback;
-it does not yet expose a peer-address-hiding relay-only mode, so privacy-sensitive identities
-should retain v2's consent service. See [the v3 model](docs/v3.md) before integrating it.
+and iroh endpoint identifiers and chosen relay; initiating iroh reveals liveness and relay-visible
+metadata before any application message is accepted. A direct-capable native endpoint may also
+reveal network-address candidates to the caller. Direct-capable and relay-only configurations each
+require the matching explicit disclosure acknowledgement. Browser/Wasm builds accept only the
+relay-only policy. See [the v3 model](docs/v3.md) before integrating it.
 
-The receiver still explicitly accepts an authenticated v3 Hello before an Ack is sent or the
-`Peer` is exposed to application payload handlers. What v3 gives up is consent *before network
-contact*, not consent before application payload processing. The transport may buffer bounded
-encrypted input from a hostile peer before that decision.
+The bounded v3 Hello embeds the sender's root-signed device certificate and device-signed locator.
+The receiver verifies that chain, the Hello signature, the live QUIC endpoint, target binding,
+application, lifetime, and replay entirely offline before showing the request. It performs no
+sender-controlled PKARR, DNS, or HTTP lookup before consent. Only explicit acceptance resolves the
+sender's current homeserver records, requires the exact certificate and locator still to be
+published, commits durable anti-rollback floors, and sends the signed Ack. No `Peer` is exposed to
+application payload handlers before that completes. V3 still gives up consent *before iroh network
+contact*, and the transport may buffer bounded encrypted input from a hostile peer beforehand.
 
 Messages use one end-to-end encrypted iroh QUIC/TLS 1.3 connection on the relayed and direct paths;
 path migration does not terminate encryption at the relay. Pubky signatures bind that QUIC

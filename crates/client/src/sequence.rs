@@ -1,19 +1,24 @@
+use std::{collections::BTreeMap, sync::Arc};
+
+#[cfg(not(target_arch = "wasm32"))]
 use std::{
-    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
+#[cfg(not(target_arch = "wasm32"))]
 use uuid::Uuid;
 
 use crate::{ClientError, Result};
 
+#[cfg(not(target_arch = "wasm32"))]
 const STATE_FILE: &str = "sequences.json";
+#[cfg(not(target_arch = "wasm32"))]
 const LOCK_FILE: &str = ".sequences.lock";
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const MAX_STATE_ENTRIES: usize = 4_096;
 
@@ -21,7 +26,8 @@ const MAX_STATE_ENTRIES: usize = 4_096;
 ///
 /// Stores must allow the same value to be observed repeatedly and reject values below the
 /// stored floor. Callers must authenticate a record before passing its counter here.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait SequenceStore: Send + Sync {
     /// Record an authenticated monotonic value, rejecting rollback.
     async fn record(&self, identity: &str, scope: &str, value: u64) -> Result<()>;
@@ -29,22 +35,28 @@ pub trait SequenceStore: Send + Sync {
 
 /// Allocate strictly increasing locator publication sequences.
 ///
-/// Production callers should use [`FileSequenceStore`]. If publisher state is lost, opening an
-/// old device credential must fail rather than silently restarting at one; issue a new root-signed
-/// device certificate and explicitly initialize its counter instead.
-#[async_trait]
+/// Production callers must use a durable, transactional implementation. If publisher state is
+/// lost, opening an old device credential must fail rather than silently restarting at one; issue
+/// a new root-signed device certificate and explicitly initialize its counter instead.
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait PublisherSequenceStore: Send + Sync {
     /// Atomically allocate the next sequence for a certified control key.
     async fn next_locator_sequence(&self, identity: &str, control_key: &str) -> Result<u64>;
 }
 
-/// Process-local anti-rollback state for tests and ephemeral clients.
+/// Process-local anti-rollback state for tests and disposable prototypes.
+///
+/// Browser applications that retain a device credential across reloads must instead provide an
+/// IndexedDB-backed transactional implementation. Pairing persistent credentials with this store
+/// can lose rollback protection or reuse publisher sequences after a reload.
 #[derive(Debug, Clone, Default)]
 pub struct MemorySequenceStore {
     values: Arc<Mutex<BTreeMap<String, u64>>>,
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl SequenceStore for MemorySequenceStore {
     async fn record(&self, identity: &str, scope: &str, value: u64) -> Result<()> {
         if value == 0 {
@@ -75,7 +87,8 @@ impl MemorySequenceStore {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl PublisherSequenceStore for MemorySequenceStore {
     async fn next_locator_sequence(&self, identity: &str, control_key: &str) -> Result<u64> {
         let key = publisher_key(identity, control_key)?;
@@ -91,11 +104,13 @@ impl PublisherSequenceStore for MemorySequenceStore {
 /// keys and are never interpreted as path components. Updates are serialized within this
 /// store instance and committed by `fsync`, rename, and directory `fsync`.
 #[derive(Debug, Clone)]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct FileSequenceStore {
     directory: Arc<PathBuf>,
     update_lock: Arc<Mutex<()>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl FileSequenceStore {
     /// Open or create an anti-rollback directory.
     ///
@@ -161,6 +176,7 @@ impl FileSequenceStore {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl SequenceStore for FileSequenceStore {
     async fn record(&self, identity: &str, scope: &str, value: u64) -> Result<()> {
@@ -181,6 +197,7 @@ impl SequenceStore for FileSequenceStore {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl PublisherSequenceStore for FileSequenceStore {
     async fn next_locator_sequence(&self, identity: &str, control_key: &str) -> Result<u64> {
@@ -270,7 +287,7 @@ fn next_publisher_value(values: &mut BTreeMap<String, u64>, key: &str) -> Result
     Ok(*value)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 fn create_private_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
 
@@ -281,11 +298,12 @@ fn create_private_directory(path: &Path) -> Result<()> {
         .map_err(|error| ClientError::State(error.to_string()))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(target_arch = "wasm32")))]
 fn create_private_directory(path: &Path) -> Result<()> {
     fs::create_dir(path).map_err(|error| ClientError::State(error.to_string()))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn update_file<T>(
     directory: &Path,
     path: &Path,
@@ -321,6 +339,7 @@ fn update_file<T>(
     Ok(result)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn read_state(path: &Path) -> Result<BTreeMap<String, u64>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -358,7 +377,7 @@ fn read_state(path: &Path) -> Result<BTreeMap<String, u64>> {
     Ok(values)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 fn validate_private_directory(metadata: &fs::Metadata) -> Result<()> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -370,7 +389,7 @@ fn validate_private_directory(metadata: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(target_arch = "wasm32")))]
 fn validate_private_directory(metadata: &fs::Metadata) -> Result<()> {
     if !metadata.is_dir() {
         return Err(ClientError::State(
@@ -380,7 +399,7 @@ fn validate_private_directory(metadata: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 fn validate_private_file(metadata: &fs::Metadata) -> Result<()> {
     use std::os::unix::fs::MetadataExt as _;
 
@@ -392,12 +411,12 @@ fn validate_private_file(metadata: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(target_arch = "wasm32")))]
 const fn validate_private_file(_metadata: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 fn private_create_new(path: &Path) -> Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -410,7 +429,7 @@ fn private_create_new(path: &Path) -> Result<File> {
         .map_err(|error| ClientError::State(error.to_string()))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(target_arch = "wasm32")))]
 fn private_create_new(path: &Path) -> Result<File> {
     OpenOptions::new()
         .write(true)
@@ -419,7 +438,7 @@ fn private_create_new(path: &Path) -> Result<File> {
         .map_err(|error| ClientError::State(error.to_string()))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 fn no_follow_read(path: &Path) -> Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -430,7 +449,7 @@ fn no_follow_read(path: &Path) -> Result<File> {
         .map_err(|error| ClientError::State(error.to_string()))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_arch = "wasm32")))]
 fn private_open_lock(path: &Path) -> Result<File> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -444,7 +463,7 @@ fn private_open_lock(path: &Path) -> Result<File> {
         .map_err(|error| ClientError::State(error.to_string()))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(target_arch = "wasm32")))]
 fn private_open_lock(path: &Path) -> Result<File> {
     OpenOptions::new()
         .read(true)
@@ -454,6 +473,7 @@ fn private_open_lock(path: &Path) -> Result<File> {
         .map_err(|error| ClientError::State(error.to_string()))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn open_and_lock(directory: &Path) -> Result<File> {
     let lock = private_open_lock(&directory.join(LOCK_FILE))?;
     validate_private_file(
@@ -465,12 +485,12 @@ fn open_and_lock(directory: &Path) -> Result<File> {
     Ok(lock)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(target_arch = "wasm32")))]
 fn no_follow_read(path: &Path) -> Result<File> {
     File::open(path).map_err(|error| ClientError::State(error.to_string()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;

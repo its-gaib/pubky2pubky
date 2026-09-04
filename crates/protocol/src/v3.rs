@@ -815,6 +815,10 @@ impl V3SignedLocator {
 pub struct V3HelloClaims {
     /// Protocol version.
     pub version: u16,
+    /// Exact Pubky-root-signed initiator device certificate presented for offline verification.
+    pub from_certificate: V3DeviceCertificate,
+    /// Exact device-signed initiator locator that must still be current when consent is granted.
+    pub from_locator: V3SignedLocator,
     /// Initiator Pubky identity.
     pub from_identity: String,
     /// Initiator device id.
@@ -856,32 +860,34 @@ pub struct V3SignedHello {
 }
 
 impl V3SignedHello {
-    /// Create a Hello bound to both certified devices and the exact target locator.
+    /// Create a Hello carrying and binding the exact sender certificate and locator, the target
+    /// certificate, and the exact target locator.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid certificates, locator, application, nonce, time, or signing.
     pub fn sign(
         credential: &V3DeviceCredential,
+        sender_locator: &V3SignedLocator,
         target_certificate: &V3DeviceCertificate,
         target_locator: &V3SignedLocator,
         application: impl Into<String>,
         session_nonce: impl Into<String>,
-        issued_at: u64,
-        expires_at: u64,
+        validity: (u64, u64),
     ) -> Result<Self> {
         Self::sign_with_policy(
             credential,
+            sender_locator,
             target_certificate,
             target_locator,
             application,
             session_nonce,
-            (issued_at, expires_at),
+            validity,
             false,
         )
     }
 
-    /// Create a Hello while explicitly accepting an HTTP loopback target locator.
+    /// Create a Hello while explicitly accepting HTTP loopback sender and target locators.
     ///
     /// Use only for a local-development transport configuration.
     ///
@@ -890,26 +896,32 @@ impl V3SignedHello {
     /// Returns the same validation and signing errors as [`Self::sign`].
     pub fn sign_for_local_development(
         credential: &V3DeviceCredential,
+        sender_locator: &V3SignedLocator,
         target_certificate: &V3DeviceCertificate,
         target_locator: &V3SignedLocator,
         application: impl Into<String>,
         session_nonce: impl Into<String>,
-        issued_at: u64,
-        expires_at: u64,
+        validity: (u64, u64),
     ) -> Result<Self> {
         Self::sign_with_policy(
             credential,
+            sender_locator,
             target_certificate,
             target_locator,
             application,
             session_nonce,
-            (issued_at, expires_at),
+            validity,
             true,
         )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "keeps both signed device publications and local-only relay policy explicit"
+    )]
     fn sign_with_policy(
         credential: &V3DeviceCredential,
+        sender_locator: &V3SignedLocator,
         target_certificate: &V3DeviceCertificate,
         target_locator: &V3SignedLocator,
         application: impl Into<String>,
@@ -921,6 +933,13 @@ impl V3SignedHello {
         credential
             .certificate
             .verify(credential.identity(), issued_at)?;
+        sender_locator.verify(
+            &credential.certificate,
+            credential.identity(),
+            issued_at,
+            allow_loopback_dev,
+            None,
+        )?;
         target_certificate.verify(&target_certificate.claims.identity, issued_at)?;
         target_locator.verify(
             target_certificate,
@@ -931,6 +950,8 @@ impl V3SignedHello {
         )?;
         let claims = V3HelloClaims {
             version: V3_PROTOCOL_VERSION,
+            from_certificate: credential.certificate.clone(),
+            from_locator: sender_locator.clone(),
             from_identity: credential.identity().to_owned(),
             from_device_id: credential.device_id().to_owned(),
             from_control_signing_key: credential.control_signing_key().to_owned(),
@@ -952,8 +973,10 @@ impl V3SignedHello {
             target_certificate,
             &claims.application,
             issued_at,
+            allow_loopback_dev,
         )?;
         if claims.target_locator_digest != target_locator.digest()?
+            || claims.expires_at > sender_locator.claims.expires_at
             || claims.expires_at > target_locator.claims.expires_at
         {
             return Err(ProtocolError::InvalidTimeWindow);
@@ -973,11 +996,22 @@ impl V3SignedHello {
         target_certificate: &V3DeviceCertificate,
         expected_application: &str,
         now: u64,
+        allow_loopback_dev: bool,
     ) -> Result<()> {
         if claims.version != V3_PROTOCOL_VERSION {
             return Err(ProtocolError::UnsupportedVersion(claims.version));
         }
         sender_certificate.verify(&claims.from_identity, now)?;
+        if &claims.from_certificate != sender_certificate {
+            return Err(ProtocolError::DeviceMismatch);
+        }
+        claims.from_locator.verify(
+            sender_certificate,
+            &claims.from_identity,
+            now,
+            allow_loopback_dev,
+            None,
+        )?;
         target_certificate.verify(&claims.to_identity, now)?;
         let sender = &sender_certificate.claims;
         let target = &target_certificate.claims;
@@ -987,6 +1021,8 @@ impl V3SignedHello {
         if claims.from_device_id != sender.device_id
             || claims.from_control_signing_key != sender.control_signing_key
             || claims.from_iroh_endpoint_id != sender.iroh_endpoint_id
+            || claims.from_locator.claims.control_signing_key != sender.control_signing_key
+            || claims.from_locator.claims.iroh_endpoint_id != sender.iroh_endpoint_id
             || claims.to_device_id != target.device_id
             || claims.to_control_signing_key != target.control_signing_key
             || claims.to_iroh_endpoint_id != target.iroh_endpoint_id
@@ -1017,6 +1053,7 @@ impl V3SignedHello {
         if claims.issued_at < sender.issued_at
             || claims.issued_at < target.issued_at
             || claims.expires_at > sender.expires_at
+            || claims.expires_at > claims.from_locator.claims.expires_at
             || claims.expires_at > target.expires_at
         {
             return Err(ProtocolError::InvalidTimeWindow);
@@ -1030,6 +1067,7 @@ impl V3SignedHello {
         target_certificate: &V3DeviceCertificate,
         expected_application: &str,
         now: u64,
+        allow_loopback_dev: bool,
     ) -> Result<()> {
         Self::validate_core(
             &self.claims,
@@ -1037,6 +1075,7 @@ impl V3SignedHello {
             target_certificate,
             expected_application,
             now,
+            allow_loopback_dev,
         )?;
         verify_signature(
             &sender_certificate.control_public_key()?,
@@ -1046,7 +1085,8 @@ impl V3SignedHello {
         )
     }
 
-    /// Verify a Hello against both certificates and the exact target locator.
+    /// Verify a Hello against its exact embedded sender certificate and locator, the supplied
+    /// target certificate, and the exact target locator.
     ///
     /// # Errors
     ///
@@ -1065,6 +1105,7 @@ impl V3SignedHello {
             target_certificate,
             expected_application,
             now,
+            allow_loopback_dev,
         )?;
         target_locator.verify(
             target_certificate,
@@ -1236,6 +1277,7 @@ impl V3SignedAck {
             hello,
             &claims.application,
             issued_at,
+            allow_loopback_dev,
         )?;
         let signature = credential
             .control_key()?
@@ -1253,6 +1295,7 @@ impl V3SignedAck {
         hello: &V3SignedHello,
         expected_application: &str,
         now: u64,
+        allow_loopback_dev: bool,
     ) -> Result<()> {
         if claims.version != V3_PROTOCOL_VERSION {
             return Err(ProtocolError::UnsupportedVersion(claims.version));
@@ -1262,6 +1305,7 @@ impl V3SignedAck {
             responder_certificate,
             expected_application,
             now,
+            allow_loopback_dev,
         )?;
         let responder = &responder_certificate.claims;
         let initiator = &initiator_certificate.claims;
@@ -1318,6 +1362,8 @@ impl V3SignedAck {
 
     /// Verify an Ack against the responder certificate and the exact signed Hello.
     ///
+    /// Set `allow_loopback_dev` only when both peers use explicitly local-development locators.
+    ///
     /// # Errors
     ///
     /// Returns an error for malformed, expired, cross-device, replay-substituted, or tampered Ack.
@@ -1328,6 +1374,7 @@ impl V3SignedAck {
         hello: &V3SignedHello,
         expected_application: &str,
         now: u64,
+        allow_loopback_dev: bool,
     ) -> Result<()> {
         Self::validate_claims(
             &self.claims,
@@ -1336,6 +1383,7 @@ impl V3SignedAck {
             hello,
             expected_application,
             now,
+            allow_loopback_dev,
         )?;
         verify_signature(
             &responder_certificate.control_public_key()?,

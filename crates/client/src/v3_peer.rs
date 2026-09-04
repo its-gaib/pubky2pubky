@@ -6,29 +6,32 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures_util::FutureExt as _;
 use hole_punchky_protocol::{
     V3_IROH_ALPN, V3_MAX_HANDSHAKE_LIFETIME_SECONDS, V3_MAX_LOCATOR_LIFETIME_SECONDS,
     V3DeviceCertificate, V3DeviceCredential, V3SignedAck, V3SignedHello, V3SignedLocator,
     now_seconds, v3_random_nonce,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use iroh::tls::CaTlsConfig;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
     TransportAddr,
     endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream, VarInt, presets},
-    tls::CaTlsConfig,
+};
+use n0_future::{
+    task::{JoinHandle, spawn},
+    time::{self, Instant},
 };
 use serde::{Deserialize, Serialize};
-use tokio::{
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot},
-    task::JoinHandle,
-};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use tracing::debug;
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    ClientError, IrohRelayConfig, Peer, PublisherSequenceStore, ResolvedV3Device, Result,
-    V3DeviceResolver,
+    ClientError, IrohRelayConfig, PathPolicy, Peer, PublisherSequenceStore, ResolvedV3Device,
+    Result, V3DeviceResolver,
 };
 
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
@@ -37,6 +40,8 @@ const MAX_TRUSTED_RELAYS: usize = 4;
 const MAX_CA_CERTIFICATES: usize = 16;
 const MAX_CA_CERTIFICATE_BYTES: usize = 64 * 1024;
 const MAX_AUTH_TOKEN_BYTES: usize = 4 * 1024;
+const MAX_BROWSER_MESSAGE_BYTES: usize = 64 * 1024;
+const DEFAULT_NATIVE_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const PER_CONNECTION_RECEIVE_WINDOW: u32 = 64 * 1024;
 const MAX_PRE_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TIMEOUT: Duration = Duration::from_mins(5);
@@ -51,11 +56,19 @@ const MAX_TIMEOUT: Duration = Duration::from_mins(5);
 pub enum PublicContactDisclosure {
     /// The application accepts address/metadata exposure before application-level consent.
     AcknowledgePreConsentNetworkExposure,
+    /// The application accepts relay-visible connection metadata before application consent.
+    ///
+    /// Relay-only peers do not reveal their IP addresses to each other, but the configured relay
+    /// can observe endpoint ids, connection timing, and traffic shape. Application payloads remain
+    /// end-to-end encrypted inside iroh QUIC.
+    AcknowledgePreConsentRelayMetadataExposure,
 }
 
-/// Native v3 endpoint, relay, handshake, and resource policy.
+/// V3 endpoint, relay, handshake, and resource policy.
 #[derive(Debug, Clone)]
 pub struct V3ClientConfig {
+    /// Whether this endpoint may use direct IP paths or is constrained to an iroh relay.
+    pub path_policy: PathPolicy,
     /// Locally trusted iroh relay origins. Locator records can only select from this set.
     pub trusted_relays: Vec<IrohRelayConfig>,
     /// Additional local DER CA roots for the trusted relays; never sourced from a locator.
@@ -91,18 +104,14 @@ pub struct V3ClientConfig {
     /// Exact application names accepted on inbound v3 connections.
     pub accepted_applications: Vec<String>,
     disclosure: PublicContactDisclosure,
-    #[cfg(test)]
-    force_relay_for_tests: bool,
 }
 
 impl V3ClientConfig {
     /// Construct direct-with-relay-fallback policy after explicit privacy acknowledgement.
     #[must_use]
-    pub fn direct(
-        _disclosure: PublicContactDisclosure,
-        accepted_applications: Vec<String>,
-    ) -> Self {
+    pub fn direct(disclosure: PublicContactDisclosure, accepted_applications: Vec<String>) -> Self {
         Self {
+            path_policy: PathPolicy::DirectWithRelayFallback,
             trusted_relays: Vec::new(),
             relay_ca_certificates: Vec::new(),
             allow_insecure_loopback_relay: false,
@@ -111,26 +120,93 @@ impl V3ClientConfig {
             pre_hello_timeout: Duration::from_secs(3),
             negotiation_timeout: Duration::from_secs(30),
             peer_handshake_timeout: Duration::from_secs(15),
-            max_message_bytes: 16 * 1024 * 1024,
+            max_message_bytes: DEFAULT_NATIVE_MESSAGE_BYTES,
             max_unauthenticated_handshakes: 16,
             incoming_queue_capacity: 16,
             max_pending_per_identity: 2,
             replay_cache_capacity: 1_024,
             replay_cache_per_identity_capacity: 32,
             accepted_applications,
-            disclosure: PublicContactDisclosure::AcknowledgePreConsentNetworkExposure,
-            #[cfg(test)]
-            force_relay_for_tests: false,
+            disclosure,
         }
     }
 
-    /// Privacy acknowledgement used to construct this direct-capable configuration.
+    /// Construct a relay-only policy after acknowledging relay-visible pre-consent metadata.
+    ///
+    /// This is the only v3 policy accepted by browser Wasm builds. Iroh terminates authenticated
+    /// QUIC in the browser; the relay forwards ciphertext and cannot read application payloads.
+    #[must_use]
+    pub fn relay_only(
+        disclosure: PublicContactDisclosure,
+        accepted_applications: Vec<String>,
+    ) -> Self {
+        Self {
+            path_policy: PathPolicy::RelayOnly,
+            trusted_relays: Vec::new(),
+            relay_ca_certificates: Vec::new(),
+            allow_insecure_loopback_relay: false,
+            udp_bind_addresses: Vec::new(),
+            endpoint_online_timeout: Duration::from_secs(15),
+            pre_hello_timeout: Duration::from_secs(3),
+            negotiation_timeout: Duration::from_secs(30),
+            peer_handshake_timeout: Duration::from_secs(15),
+            max_message_bytes: if cfg!(target_arch = "wasm32") {
+                MAX_BROWSER_MESSAGE_BYTES
+            } else {
+                DEFAULT_NATIVE_MESSAGE_BYTES
+            },
+            max_unauthenticated_handshakes: 16,
+            incoming_queue_capacity: 16,
+            max_pending_per_identity: 2,
+            replay_cache_capacity: 1_024,
+            replay_cache_per_identity_capacity: 32,
+            accepted_applications,
+            disclosure,
+        }
+    }
+
+    /// Privacy acknowledgement used to construct this configuration.
     #[must_use]
     pub const fn public_contact_disclosure(&self) -> PublicContactDisclosure {
         self.disclosure
     }
 
+    fn validate_policy_disclosure(&self) -> Result<()> {
+        match (self.path_policy, self.disclosure) {
+            (
+                PathPolicy::DirectWithRelayFallback,
+                PublicContactDisclosure::AcknowledgePreConsentNetworkExposure,
+            )
+            | (
+                PathPolicy::RelayOnly,
+                PublicContactDisclosure::AcknowledgePreConsentRelayMetadataExposure,
+            ) => {}
+            _ => {
+                return Err(ClientError::Iroh(
+                    "v3 path policy does not match its privacy acknowledgement".to_owned(),
+                ));
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        if self.path_policy != PathPolicy::RelayOnly
+            || self.allow_insecure_loopback_relay
+            || !self.relay_ca_certificates.is_empty()
+            || self
+                .trusted_relays
+                .iter()
+                .any(|relay| relay.auth_token.is_some())
+            || self.max_message_bytes > MAX_BROWSER_MESSAGE_BYTES
+        {
+            return Err(ClientError::Iroh(
+                "browser v3 requires HTTPS relay-only transport without tokens, custom CAs, or oversized messages"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
+        self.validate_policy_disclosure()?;
         if self.trusted_relays.is_empty() || self.trusted_relays.len() > MAX_TRUSTED_RELAYS {
             return Err(ClientError::Iroh(
                 "v3 requires one to four locally trusted relays".to_owned(),
@@ -163,20 +239,30 @@ impl V3ClientConfig {
                 "invalid local relay CA certificate set".to_owned(),
             ));
         }
-        if self.udp_bind_addresses.is_empty() || self.udp_bind_addresses.len() > 2 {
-            return Err(ClientError::Iroh(
-                "v3 direct mode requires one or two UDP bind addresses".to_owned(),
-            ));
-        }
-        let mut families = HashSet::new();
-        if self
-            .udp_bind_addresses
-            .iter()
-            .any(|address| !families.insert(address.is_ipv4()))
-        {
-            return Err(ClientError::Iroh(
-                "v3 accepts at most one UDP bind per IP family".to_owned(),
-            ));
+        match self.path_policy {
+            PathPolicy::DirectWithRelayFallback => {
+                if self.udp_bind_addresses.is_empty() || self.udp_bind_addresses.len() > 2 {
+                    return Err(ClientError::Iroh(
+                        "v3 direct mode requires one or two UDP bind addresses".to_owned(),
+                    ));
+                }
+                let mut families = HashSet::new();
+                if self
+                    .udp_bind_addresses
+                    .iter()
+                    .any(|address| !families.insert(address.is_ipv4()))
+                {
+                    return Err(ClientError::Iroh(
+                        "v3 accepts at most one UDP bind per IP family".to_owned(),
+                    ));
+                }
+            }
+            PathPolicy::RelayOnly if !self.udp_bind_addresses.is_empty() => {
+                return Err(ClientError::Iroh(
+                    "v3 relay-only mode forbids UDP bind addresses".to_owned(),
+                ));
+            }
+            PathPolicy::RelayOnly => {}
         }
         if self.endpoint_online_timeout.is_zero()
             || self.pre_hello_timeout.is_zero()
@@ -237,13 +323,15 @@ struct V3Inner {
     _accept_task: AbortTask,
 }
 
-/// Native Pubky-discovered iroh v3 endpoint.
+/// Pubky-discovered iroh v3 endpoint for native or relay-only browser peers.
 ///
 /// Every returned [`Peer`] is the single bounded stream of an iroh-authenticated TLS 1.3 QUIC
 /// connection under the fixed v3 ALPN. There is no plaintext or non-QUIC message fallback.
 /// Iroh 1.1 does not expose an inbound server switch that universally rejects hostile 0-RTT.
 /// This client awaits the full handshake, never opts into the 0-RTT API, bounds pre-consent flow
-/// control, and authenticates/replay-checks Hello before surfacing a consent request.
+/// control, and authenticates/replay-checks the certificate-bearing Hello entirely offline before
+/// surfacing a consent request. Current Pubky publication and revocation state are checked only
+/// after the application explicitly accepts.
 #[derive(Clone)]
 pub struct V3Client {
     inner: Arc<V3Inner>,
@@ -254,22 +342,61 @@ struct PendingV3 {
     send: SendStream,
     recv: RecvStream,
     local: Arc<V3DeviceCredential>,
+    resolver: Arc<dyn V3DeviceResolver>,
     sender_certificate: V3DeviceCertificate,
+    sender_locator: V3SignedLocator,
     target_locator: V3SignedLocator,
     hello: V3SignedHello,
     max_message_bytes: usize,
     allow_insecure_loopback_relay: bool,
-    deadline: tokio::time::Instant,
+    deadline: Instant,
     expiry_cancel: Option<oneshot::Sender<()>>,
     _capacity_permit: OwnedSemaphorePermit,
 }
 
-/// A current-directory-authenticated v3 Hello awaiting application consent.
+impl PendingV3 {
+    async fn revalidate_and_commit_sender(&self) -> Result<ResolvedV3Device> {
+        if self.deadline <= Instant::now() || now_seconds() > self.hello.claims.expires_at {
+            return Err(ClientError::Timeout("accepting inbound v3 peer"));
+        }
+        let devices = timeout_at(
+            self.deadline,
+            self.resolver
+                .resolve_devices_for_accepted_inbound(&self.hello.claims.from_identity),
+        )
+        .await
+        .map_err(|_| ClientError::Timeout("revalidating accepted v3 peer"))??;
+        let current = devices
+            .into_iter()
+            .find(|device| {
+                device.certificate == self.sender_certificate
+                    && device.locator == self.sender_locator
+            })
+            .ok_or(ClientError::UnexpectedPeer)?;
+        self.hello.verify(
+            &current.certificate,
+            &self.local.certificate,
+            &self.target_locator,
+            &self.hello.claims.application,
+            now_seconds(),
+            self.allow_insecure_loopback_relay,
+        )?;
+        timeout_at(self.deadline, self.resolver.commit_device(&current))
+            .await
+            .map_err(|_| ClientError::Timeout("committing accepted v3 peer"))??;
+        Ok(current)
+    }
+}
+
+/// An offline-authenticated v3 Hello awaiting application consent.
 ///
 /// At this stage QUIC has already contacted the recipient and iroh may have revealed public
-/// network addresses while attempting a direct path. No signed Ack is sent and no application
-/// [`Peer`] is released until [`Self::accept`] is called. Dropping or rejecting this value closes
-/// the connection.
+/// network addresses while attempting a direct path. The embedded device certificate, locator,
+/// Hello signature, remote iroh endpoint, target binding, application, lifetime, and replay key
+/// have been verified without Pubky/PKARR or homeserver egress. Whether that exact certificate and
+/// locator remain in the sender's current directory is deliberately not checked until
+/// [`Self::accept`]. No signed Ack is sent and no application [`Peer`] is released before then.
+/// Dropping or rejecting this value closes the connection.
 pub struct IncomingV3 {
     pending: Option<PendingV3>,
 }
@@ -288,7 +415,9 @@ impl std::fmt::Debug for IncomingV3 {
 }
 
 impl IncomingV3 {
-    /// Authenticated caller Pubky identity.
+    /// Cryptographically root-signed caller Pubky identity.
+    ///
+    /// Current directory membership and revocation state are checked by [`Self::accept`].
     #[must_use]
     pub fn identity(&self) -> &str {
         self.pending
@@ -296,7 +425,9 @@ impl IncomingV3 {
             .map_or("", |pending| &pending.hello.claims.from_identity)
     }
 
-    /// Authenticated caller device id.
+    /// Cryptographically certified caller device id.
+    ///
+    /// Current directory membership and revocation state are checked by [`Self::accept`].
     #[must_use]
     pub fn device_id(&self) -> &str {
         self.pending
@@ -319,18 +450,20 @@ impl IncomingV3 {
     /// Returns an error if the bounded consent window elapsed or the Ack cannot be signed/sent.
     pub async fn accept(mut self) -> Result<Peer> {
         let mut pending = self.pending.take().ok_or(ClientError::ChannelClosed)?;
-        let Some(remaining) = pending
-            .deadline
-            .checked_duration_since(tokio::time::Instant::now())
-        else {
+        let current_sender = match pending.revalidate_and_commit_sender().await {
+            Ok(current) => current,
+            Err(error) => {
+                pending
+                    .connection
+                    .close(1u32.into(), b"v3 peer revalidation failed");
+                return Err(error);
+            }
+        };
+        let Some(remaining) = pending.deadline.checked_duration_since(Instant::now()) else {
             pending.connection.close(1u32.into(), b"v3 consent expired");
             return Err(ClientError::Timeout("accepting inbound v3 peer"));
         };
         let now = now_seconds();
-        if now > pending.hello.claims.expires_at {
-            pending.connection.close(1u32.into(), b"v3 consent expired");
-            return Err(ClientError::Timeout("accepting inbound v3 peer"));
-        }
         let expires_at = pending
             .hello
             .claims
@@ -340,7 +473,7 @@ impl IncomingV3 {
             V3SignedAck::sign_for_local_development(
                 &pending.local,
                 &pending.hello,
-                &pending.sender_certificate,
+                &current_sender.certificate,
                 &pending.target_locator,
                 v3_random_nonce(),
                 now,
@@ -350,7 +483,7 @@ impl IncomingV3 {
             V3SignedAck::sign(
                 &pending.local,
                 &pending.hello,
-                &pending.sender_certificate,
+                &current_sender.certificate,
                 &pending.target_locator,
                 v3_random_nonce(),
                 now,
@@ -364,7 +497,7 @@ impl IncomingV3 {
                 return Err(error.into());
             }
         };
-        if let Err(error) = tokio::time::timeout(
+        if let Err(error) = time::timeout(
             remaining,
             write_json(&mut pending.send, &ack, MAX_HANDSHAKE_BYTES),
         )
@@ -391,8 +524,8 @@ impl IncomingV3 {
             pending.send,
             pending.recv,
             session_id,
-            pending.sender_certificate.claims.identity,
-            pending.sender_certificate.claims.device_id,
+            current_sender.certificate.claims.identity,
+            current_sender.certificate.claims.device_id,
             pending.max_message_bytes,
         ))
     }
@@ -448,7 +581,7 @@ impl PendingQueue {
 
     async fn insert(&self, key: String, incoming: IncomingV3) -> Result<()> {
         let mut state = self.state.lock().await;
-        Self::prune_expired(&mut state, tokio::time::Instant::now());
+        Self::prune_expired(&mut state, Instant::now());
         if state.closed {
             return Err(ClientError::ChannelClosed);
         }
@@ -484,7 +617,7 @@ impl PendingQueue {
             let notified = self.notify.notified();
             {
                 let mut state = self.state.lock().await;
-                Self::prune_expired(&mut state, tokio::time::Instant::now());
+                Self::prune_expired(&mut state, Instant::now());
                 while let Some(key) = state.order.pop_front() {
                     if let Some(incoming) = Self::remove(&mut state, &key) {
                         return Ok(incoming);
@@ -508,7 +641,7 @@ impl PendingQueue {
         self.notify.notify_waiters();
     }
 
-    fn prune_expired(state: &mut PendingQueueState, now: tokio::time::Instant) {
+    fn prune_expired(state: &mut PendingQueueState, now: Instant) {
         let expired: Vec<String> = state
             .entries
             .iter()
@@ -541,7 +674,7 @@ impl PendingQueue {
     #[cfg(test)]
     async fn len(&self) -> usize {
         let mut state = self.state.lock().await;
-        Self::prune_expired(&mut state, tokio::time::Instant::now());
+        Self::prune_expired(&mut state, Instant::now());
         state.entries.len()
     }
 }
@@ -560,8 +693,9 @@ impl std::fmt::Debug for V3Client {
 impl V3Client {
     /// Bind a v3 iroh endpoint and start a bounded authenticated accept loop.
     ///
-    /// `resolver` is also used on inbound Hello messages to require that the caller's exact
-    /// certificate remains present in its current root-signed Pubky directory.
+    /// After an inbound Hello is surfaced and explicitly accepted, `resolver` requires that the
+    /// caller's exact embedded certificate and locator remain present in its current root-signed
+    /// Pubky publication. It is never invoked for remotely supplied discovery before consent.
     ///
     /// # Errors
     ///
@@ -606,7 +740,7 @@ impl V3Client {
             .stream_receive_window(VarInt::from_u32(PER_CONNECTION_RECEIVE_WINDOW))
             .receive_window(VarInt::from_u32(PER_CONNECTION_RECEIVE_WINDOW))
             .build();
-        let mut builder = Endpoint::builder(presets::Minimal)
+        let builder = Endpoint::builder(presets::Minimal)
             .secret_key(secret)
             .alpns(vec![V3_IROH_ALPN.to_vec()])
             // The public v3 API never opts into iroh 0-RTT. Also retain no client-side TLS
@@ -617,18 +751,21 @@ impl V3Client {
             .relay_mode(RelayMode::Custom(
                 relay_configs.into_iter().collect::<RelayMap>(),
             ))
-            .clear_address_lookup()
-            .clear_ip_transports();
+            .clear_address_lookup();
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut builder = builder.clear_ip_transports();
+        #[cfg(target_arch = "wasm32")]
+        let builder = builder;
+        #[cfg(not(target_arch = "wasm32"))]
         if !config.relay_ca_certificates.is_empty() {
             builder = builder
                 .ca_tls_config(CaTlsConfig::default().with_extra_roots(
                     config.relay_ca_certificates.iter().cloned().map(Into::into),
                 ));
         }
-        #[cfg(test)]
-        let bind_direct = !config.force_relay_for_tests;
-        #[cfg(not(test))]
-        let bind_direct = true;
+        #[cfg(not(target_arch = "wasm32"))]
+        let bind_direct = config.path_policy == PathPolicy::DirectWithRelayFallback;
+        #[cfg(not(target_arch = "wasm32"))]
         if bind_direct {
             for address in &config.udp_bind_addresses {
                 builder = builder
@@ -640,7 +777,7 @@ impl V3Client {
             .bind()
             .await
             .map_err(|error| ClientError::Iroh(error.to_string()))?;
-        if tokio::time::timeout(config.endpoint_online_timeout, endpoint.online())
+        if time::timeout(config.endpoint_online_timeout, endpoint.online())
             .await
             .is_err()
         {
@@ -667,7 +804,7 @@ impl V3Client {
         let task_locators = Arc::clone(&active_locators);
         let task_pending = Arc::clone(&pending);
         let task_config = config.clone();
-        let task = tokio::spawn(async move {
+        let task = spawn(async move {
             while let Some(incoming) = task_endpoint.accept().await {
                 let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
                     drop(incoming);
@@ -679,8 +816,8 @@ impl V3Client {
                 let replay = Arc::clone(&replay);
                 let pending = Arc::clone(&task_pending);
                 let config = task_config.clone();
-                let pre_hello_deadline = tokio::time::Instant::now() + config.pre_hello_timeout;
-                tokio::spawn(async move {
+                let pre_hello_deadline = Instant::now() + config.pre_hello_timeout;
+                drop(spawn(async move {
                     if let Err(error) = handle_incoming_v3(
                         incoming,
                         credential,
@@ -696,7 +833,7 @@ impl V3Client {
                     {
                         debug!(%error, "discarded unauthenticated v3 iroh connection");
                     }
-                });
+                }));
             }
         });
 
@@ -843,7 +980,7 @@ impl V3Client {
         application: &str,
     ) -> Result<Peer> {
         validate_application(application)?;
-        tokio::time::timeout(
+        time::timeout(
             self.inner.config.negotiation_timeout,
             self.dial_inner(target_identity, target_device_id, application),
         )
@@ -914,7 +1051,7 @@ impl V3Client {
                 .into_iter()
                 .map(|url| TransportAddr::Relay(RelayUrl::from(url))),
         );
-        let connection = tokio::time::timeout(
+        let connection = time::timeout(
             self.inner.config.peer_handshake_timeout,
             self.inner.endpoint.connect(address, V3_IROH_ALPN),
         )
@@ -940,7 +1077,7 @@ impl V3Client {
         if connection.remote_id() != expected_id {
             return Err(ClientError::UnexpectedPeer);
         }
-        let (mut send, mut recv) = tokio::time::timeout(
+        let (mut send, mut recv) = time::timeout(
             self.inner.config.peer_handshake_timeout,
             connection.open_bi(),
         )
@@ -948,30 +1085,49 @@ impl V3Client {
         .map_err(|_| ClientError::Timeout("opening v3 authenticated QUIC stream"))?
         .map_err(|error| ClientError::Iroh(error.to_string()))?;
         let now = now_seconds();
+        let sender_locator = {
+            let mut active = self.inner.active_locators.lock().await;
+            active.retain(|_, locator| locator.claims.expires_at >= now);
+            active
+                .iter()
+                .max_by(|(left_digest, left), (right_digest, right)| {
+                    left.claims
+                        .sequence
+                        .cmp(&right.claims.sequence)
+                        .then_with(|| left_digest.cmp(right_digest))
+                })
+                .map(|(_, locator)| locator.clone())
+        }
+        .ok_or_else(|| {
+            ClientError::State(
+                "a current local v3 locator must be registered before dialing".to_owned(),
+            )
+        })?;
         let expiry = now
             .saturating_add(V3_MAX_HANDSHAKE_LIFETIME_SECONDS.min(30))
+            .min(sender_locator.claims.expires_at)
             .min(target.locator.claims.expires_at)
             .min(target.certificate.claims.expires_at)
             .min(self.inner.credential.certificate.claims.expires_at);
         let hello = if self.inner.config.allow_insecure_loopback_relay {
             V3SignedHello::sign_for_local_development(
                 &self.inner.credential,
+                &sender_locator,
                 &target.certificate,
                 &target.locator,
                 application,
                 v3_random_nonce(),
-                now,
-                expiry,
+                (now, expiry),
             )?
         } else {
             V3SignedHello::sign(
                 &self.inner.credential,
+                &sender_locator,
                 &target.certificate,
                 &target.locator,
                 application,
                 v3_random_nonce(),
-                now,
-                expiry,
+                (now, expiry),
             )?
         };
         let handshake = async {
@@ -983,10 +1139,11 @@ impl V3Client {
                 &hello,
                 application,
                 now_seconds(),
+                self.inner.config.allow_insecure_loopback_relay,
             )?;
             Result::<()>::Ok(())
         };
-        tokio::time::timeout(self.inner.config.peer_handshake_timeout, handshake)
+        time::timeout(self.inner.config.peer_handshake_timeout, handshake)
             .await
             .map_err(|_| ClientError::Timeout("exchanging signed v3 Hello/Ack"))??;
         let session_id = nonce_uuid(&hello.claims.session_nonce)?;
@@ -1001,11 +1158,13 @@ impl V3Client {
         ))
     }
 
-    /// Receive the next authenticated Hello for an explicit application consent decision.
+    /// Receive the next offline-authenticated Hello for an explicit application consent decision.
     ///
-    /// Network requests are not surfaced until current Pubky discovery, endpoint-id matching,
-    /// signed Hello verification, and replay checks have succeeded. Call
-    /// [`IncomingV3::accept`] to send the signed Ack and obtain a [`Peer`].
+    /// The embedded root-signed device certificate and device-signed locator, endpoint-id
+    /// matching, signed Hello, target binding, and replay checks have succeeded without any
+    /// sender-controlled network discovery. Current Pubky directory membership and revocation
+    /// state remain intentionally unchecked. Call [`IncomingV3::accept`] to perform that bounded
+    /// discovery, commit anti-rollback floors, send the signed Ack, and obtain a [`Peer`].
     ///
     /// # Errors
     ///
@@ -1097,10 +1256,10 @@ async fn handle_incoming_v3(
     replay: Arc<Mutex<ReplayCache>>,
     pending_queue: Arc<PendingQueue>,
     config: V3ClientConfig,
-    pre_hello_deadline: tokio::time::Instant,
+    pre_hello_deadline: Instant,
     capacity_permit: OwnedSemaphorePermit,
 ) -> Result<()> {
-    let connection = tokio::time::timeout_at(pre_hello_deadline, async move { incoming.await })
+    let connection = timeout_at(pre_hello_deadline, async move { incoming.await })
         .await
         .map_err(|_| ClientError::Timeout("pre-authenticating inbound v3 QUIC"))?
         .map_err(|error| ClientError::Iroh(error.to_string()))?;
@@ -1134,7 +1293,7 @@ async fn authenticate_incoming_v3(
     replay: Arc<Mutex<ReplayCache>>,
     pending_queue: Arc<PendingQueue>,
     config: &V3ClientConfig,
-    pre_hello_deadline: tokio::time::Instant,
+    pre_hello_deadline: Instant,
     capacity_permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     let remote_endpoint = connection.remote_id();
@@ -1155,24 +1314,8 @@ async fn authenticate_incoming_v3(
         }
         .ok_or(ClientError::UnexpectedPeer)?;
 
-        let sender_devices = resolver
-            .resolve_devices(&hello.claims.from_identity)
-            .await?;
-        let sender_device = sender_devices
-            .into_iter()
-            .find(|device| {
-                device.certificate.claims.control_signing_key
-                    == hello.claims.from_control_signing_key
-                    && device.certificate.claims.iroh_endpoint_id
-                        == hello.claims.from_iroh_endpoint_id
-            })
-            .ok_or(ClientError::UnexpectedPeer)?;
-        let sender_certificate = sender_device.certificate;
-        let certified_remote = EndpointId::from_z32(&sender_certificate.claims.iroh_endpoint_id)
-            .map_err(|error| ClientError::Iroh(error.to_string()))?;
-        if certified_remote != remote_endpoint {
-            return Err(ClientError::UnexpectedPeer);
-        }
+        let sender_certificate = hello.claims.from_certificate.clone();
+        let sender_locator = hello.claims.from_locator.clone();
         hello.verify(
             &sender_certificate,
             &local.certificate,
@@ -1181,6 +1324,11 @@ async fn authenticate_incoming_v3(
             now_seconds(),
             config.allow_insecure_loopback_relay,
         )?;
+        let certified_remote = EndpointId::from_z32(&sender_certificate.claims.iroh_endpoint_id)
+            .map_err(|error| ClientError::Iroh(error.to_string()))?;
+        if certified_remote != remote_endpoint {
+            return Err(ClientError::UnexpectedPeer);
+        }
         let deadline = pending_deadline(
             hello.claims.expires_at,
             config.peer_handshake_timeout,
@@ -1198,7 +1346,9 @@ async fn authenticate_incoming_v3(
                         send,
                         recv,
                         local,
+                        resolver,
                         sender_certificate,
+                        sender_locator,
                         target_locator,
                         hello,
                         max_message_bytes: config.max_message_bytes,
@@ -1225,19 +1375,20 @@ async fn authenticate_incoming_v3(
         );
         Ok(())
     };
-    // Directory resolution may require the directory plus up to eight bounded locator fetches,
-    // so it gets the ordinary handshake budget rather than the strict pre-Hello deadline. The
-    // same global unauthenticated permit remains held until verification succeeds or times out.
-    tokio::time::timeout(config.peer_handshake_timeout, operation)
+    // Every operation here is offline. In particular, a remotely supplied identity cannot cause
+    // Pubky/PKARR, homeserver, DNS, redirect, or direct-address egress before application consent.
+    // The same global unauthenticated permit remains held until verification succeeds or times
+    // out.
+    time::timeout(config.peer_handshake_timeout, operation)
         .await
         .map_err(|_| ClientError::Timeout("authenticating signed inbound v3 Hello"))?
 }
 
 async fn receive_initial_hello(
     connection: &Connection,
-    deadline: tokio::time::Instant,
+    deadline: Instant,
 ) -> Result<(SendStream, RecvStream, V3SignedHello)> {
-    tokio::time::timeout_at(deadline, async {
+    timeout_at(deadline, async {
         let (send, mut recv) = connection
             .accept_bi()
             .await
@@ -1270,18 +1421,18 @@ async fn reserve_replay(replay: &Arc<Mutex<ReplayCache>>, hello: &V3SignedHello)
     Ok(key)
 }
 
-fn pending_deadline(expires_at: u64, limit: Duration, now: u64) -> Result<tokio::time::Instant> {
+fn pending_deadline(expires_at: u64, limit: Duration, now: u64) -> Result<Instant> {
     let lifetime = limit.min(Duration::from_secs(expires_at.saturating_sub(now)));
     if lifetime.is_zero() {
         return Err(ClientError::Timeout("queueing inbound v3 consent"));
     }
-    Ok(tokio::time::Instant::now() + lifetime)
+    Ok(Instant::now() + lifetime)
 }
 
 fn spawn_pending_expiry(
     pending_queue: &Arc<PendingQueue>,
     replay_key: String,
-    deadline: tokio::time::Instant,
+    deadline: Instant,
     connection: Connection,
     cancelled: oneshot::Receiver<()>,
 ) {
@@ -1289,17 +1440,33 @@ fn spawn_pending_expiry(
     // The queue owns the pending request, but the timer owns only a weak queue reference. Thus a
     // blocked application need not poll `next_incoming` for expiry to remove the entry, close the
     // connection, and release both its queue capacity and handshake permit.
-    drop(tokio::spawn(async move {
-        tokio::select! {
-            () = tokio::time::sleep_until(deadline) => {
+    drop(spawn(async move {
+        let timeout = time::sleep_until(deadline).fuse();
+        let cancelled = cancelled.fuse();
+        futures_util::pin_mut!(timeout, cancelled);
+        futures_util::select_biased! {
+            _ = cancelled => {}
+            () = timeout => {
                 if let Some(queue) = weak_queue.upgrade() {
                     queue.expire(&replay_key).await;
                 }
                 connection.close(1u32.into(), b"v3 consent timeout");
             }
-            _ = cancelled => {}
         }
     }));
+}
+
+async fn timeout_at<F>(
+    deadline: Instant,
+    future: F,
+) -> std::result::Result<F::Output, time::Elapsed>
+where
+    F: std::future::Future,
+{
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .unwrap_or(Duration::ZERO);
+    time::timeout(remaining, future).await
 }
 
 fn trusted_destination_relays(
@@ -1428,9 +1595,16 @@ async fn read_bytes(stream: &mut RecvStream, max: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+    use std::{
+        net::Ipv4Addr,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use hole_punchky_protocol::{V3DeviceCredential, now_seconds};
     use iroh_relay::server::{
@@ -1440,9 +1614,54 @@ mod tests {
     use pubky::Keypair;
 
     use super::*;
-    use crate::{ConnectionPath, StaticV3Resolver};
+    use crate::{ConnectionPath, SequenceStore, StaticV3Resolver};
 
     const TEST_APPLICATION: &str = "pubky2pubky/test/echo";
+
+    #[derive(Debug, Default)]
+    struct CountingSequenceStore {
+        writes: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SequenceStore for CountingSequenceStore {
+        async fn record(&self, _identity: &str, _scope: &str, _value: u64) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingV3Resolver {
+        inner: StaticV3Resolver,
+        outbound_resolutions: AtomicUsize,
+        accepted_inbound_resolutions: AtomicUsize,
+        commits: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl V3DeviceResolver for CountingV3Resolver {
+        async fn resolve_devices(&self, identity: &str) -> Result<Vec<ResolvedV3Device>> {
+            self.outbound_resolutions.fetch_add(1, Ordering::Relaxed);
+            self.inner.resolve_devices(identity).await
+        }
+
+        async fn resolve_devices_for_accepted_inbound(
+            &self,
+            identity: &str,
+        ) -> Result<Vec<ResolvedV3Device>> {
+            self.accepted_inbound_resolutions
+                .fetch_add(1, Ordering::Relaxed);
+            self.inner
+                .resolve_devices_for_accepted_inbound(identity)
+                .await
+        }
+
+        async fn commit_device(&self, device: &ResolvedV3Device) -> Result<()> {
+            self.commits.fetch_add(1, Ordering::Relaxed);
+            self.inner.commit_device(device).await
+        }
+    }
 
     fn credential(root: &Keypair, device: &str) -> V3DeviceCredential {
         let now = now_seconds();
@@ -1465,17 +1684,25 @@ mod tests {
     }
 
     fn config(relay_url: Url, force_relay: bool, handshake_timeout: Duration) -> V3ClientConfig {
-        let mut config = V3ClientConfig::direct(
-            PublicContactDisclosure::AcknowledgePreConsentNetworkExposure,
-            vec![TEST_APPLICATION.to_owned()],
-        );
+        let mut config = if force_relay {
+            V3ClientConfig::relay_only(
+                PublicContactDisclosure::AcknowledgePreConsentRelayMetadataExposure,
+                vec![TEST_APPLICATION.to_owned()],
+            )
+        } else {
+            V3ClientConfig::direct(
+                PublicContactDisclosure::AcknowledgePreConsentNetworkExposure,
+                vec![TEST_APPLICATION.to_owned()],
+            )
+        };
         config.trusted_relays = vec![IrohRelayConfig::new(relay_url)];
         config.allow_insecure_loopback_relay = true;
-        config.udp_bind_addresses = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
+        if !force_relay {
+            config.udp_bind_addresses = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
+        }
         config.endpoint_online_timeout = Duration::from_secs(10);
         config.negotiation_timeout = Duration::from_secs(15);
         config.peer_handshake_timeout = handshake_timeout;
-        config.force_relay_for_tests = force_relay;
         config
     }
 
@@ -1623,6 +1850,204 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn relay_fallback_carries_authenticated_stream_when_ip_is_disabled() {
         consent_and_echo(true, ConnectionPath::Relayed).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inbound_pubky_resolution_starts_only_after_explicit_accept() {
+        let (relay, relay_url) = relay().await;
+        let alice_resolver = Arc::new(StaticV3Resolver::new(true));
+        let bob_resolver = Arc::new(CountingV3Resolver {
+            inner: StaticV3Resolver::new(true),
+            ..CountingV3Resolver::default()
+        });
+        let alice = V3Client::bind(
+            credential(&Keypair::random(), "alice-device"),
+            alice_resolver.clone(),
+            config(relay_url.clone(), true, Duration::from_secs(10)),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("binding Alice: {error}"));
+        let bob = V3Client::bind(
+            credential(&Keypair::random(), "bob-device"),
+            bob_resolver.clone(),
+            config(relay_url, true, Duration::from_secs(10)),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("binding Bob: {error}"));
+        let alice_locator = alice
+            .current_locator(1, Duration::from_secs(300))
+            .await
+            .unwrap_or_else(|error| panic!("Alice locator: {error}"));
+        let bob_locator = bob
+            .current_locator(1, Duration::from_secs(300))
+            .await
+            .unwrap_or_else(|error| panic!("Bob locator: {error}"));
+        alice_resolver
+            .insert(bob.certificate().clone(), bob_locator)
+            .await;
+        bob_resolver
+            .inner
+            .insert(alice.certificate().clone(), alice_locator)
+            .await;
+
+        let dialing_alice = alice.clone();
+        let bob_identity = bob.identity().to_owned();
+        let dial = tokio::spawn(async move {
+            dialing_alice
+                .dial(&bob_identity, None, TEST_APPLICATION)
+                .await
+        });
+        let incoming = tokio::time::timeout(Duration::from_secs(5), bob.next_incoming())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for offline-authenticated Hello"))
+            .unwrap_or_else(|error| panic!("receiving offline-authenticated Hello: {error}"));
+
+        assert_eq!(
+            bob_resolver
+                .accepted_inbound_resolutions
+                .load(Ordering::Relaxed),
+            0,
+            "no resolver, Pubky, PKARR, DNS, or homeserver call may precede consent"
+        );
+        assert_eq!(bob_resolver.commits.load(Ordering::Relaxed), 0);
+
+        let bob_peer = incoming
+            .accept()
+            .await
+            .unwrap_or_else(|error| panic!("accepting Hello: {error}"));
+        let alice_peer = tokio::time::timeout(Duration::from_secs(5), dial)
+            .await
+            .unwrap_or_else(|_| panic!("accepted dial did not complete"))
+            .unwrap_or_else(|error| panic!("dial task stopped: {error}"))
+            .unwrap_or_else(|error| panic!("accepted dial failed: {error}"));
+        assert_eq!(
+            bob_resolver
+                .accepted_inbound_resolutions
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(bob_resolver.commits.load(Ordering::Relaxed), 1);
+
+        alice_peer
+            .close()
+            .await
+            .unwrap_or_else(|error| panic!("closing Alice peer: {error}"));
+        bob_peer
+            .close()
+            .await
+            .unwrap_or_else(|error| panic!("closing Bob peer: {error}"));
+        alice.close().await;
+        bob.close().await;
+        relay
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("stopping relay: {error}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inbound_floors_commit_only_after_exact_publication_is_revalidated() {
+        let (relay, relay_url) = relay().await;
+        let durable = Arc::new(CountingSequenceStore::default());
+        let alice_resolver = Arc::new(StaticV3Resolver::new(true));
+        let bob_resolver =
+            Arc::new(StaticV3Resolver::new(true).with_sequence_store(durable.clone()));
+        let alice_credential = credential(&Keypair::random(), "alice-device");
+        let bob_credential = credential(&Keypair::random(), "bob-device");
+        let alice = V3Client::bind(
+            alice_credential,
+            alice_resolver.clone(),
+            config(relay_url.clone(), true, Duration::from_secs(10)),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("binding Alice: {error}"));
+        let bob = V3Client::bind(
+            bob_credential,
+            bob_resolver.clone(),
+            config(relay_url, true, Duration::from_secs(10)),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("binding Bob: {error}"));
+        let alice_locator = alice
+            .current_locator(1, Duration::from_secs(300))
+            .await
+            .unwrap_or_else(|error| panic!("Alice locator: {error}"));
+        let bob_locator = bob
+            .current_locator(1, Duration::from_secs(300))
+            .await
+            .unwrap_or_else(|error| panic!("Bob locator: {error}"));
+        alice_resolver
+            .insert(bob.certificate().clone(), bob_locator)
+            .await;
+        bob_resolver
+            .insert(alice.certificate().clone(), alice_locator)
+            .await;
+        let bob_identity = bob.identity().to_owned();
+
+        let first_alice = alice.clone();
+        let first_identity = bob_identity.clone();
+        let first_dial = tokio::spawn(async move {
+            first_alice
+                .dial(&first_identity, None, TEST_APPLICATION)
+                .await
+        });
+        let first_incoming = tokio::time::timeout(Duration::from_secs(5), bob.next_incoming())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for first Hello"))
+            .unwrap_or_else(|error| panic!("receiving first Hello: {error}"));
+        assert_eq!(durable.writes.load(Ordering::Relaxed), 0);
+
+        let replacement = alice
+            .current_locator(2, Duration::from_secs(300))
+            .await
+            .unwrap_or_else(|error| panic!("replacement Alice locator: {error}"));
+        bob_resolver.replace(Vec::new()).await;
+        bob_resolver
+            .insert(alice.certificate().clone(), replacement)
+            .await;
+        assert!(first_incoming.accept().await.is_err());
+        assert_eq!(durable.writes.load(Ordering::Relaxed), 0);
+        let first_result = tokio::time::timeout(Duration::from_secs(5), first_dial)
+            .await
+            .unwrap_or_else(|_| panic!("changed-publication dial did not close"))
+            .unwrap_or_else(|error| panic!("first dial task stopped: {error}"));
+        assert!(first_result.is_err());
+
+        let second_alice = alice.clone();
+        let second_dial = tokio::spawn(async move {
+            second_alice
+                .dial(&bob_identity, None, TEST_APPLICATION)
+                .await
+        });
+        let second_incoming = tokio::time::timeout(Duration::from_secs(5), bob.next_incoming())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for second Hello"))
+            .unwrap_or_else(|error| panic!("receiving second Hello: {error}"));
+        assert_eq!(durable.writes.load(Ordering::Relaxed), 0);
+        let bob_peer = second_incoming
+            .accept()
+            .await
+            .unwrap_or_else(|error| panic!("accepting revalidated Hello: {error}"));
+        let alice_peer = tokio::time::timeout(Duration::from_secs(5), second_dial)
+            .await
+            .unwrap_or_else(|_| panic!("accepted dial did not complete"))
+            .unwrap_or_else(|error| panic!("second dial task stopped: {error}"))
+            .unwrap_or_else(|error| panic!("second dial failed: {error}"));
+        assert_eq!(durable.writes.load(Ordering::Relaxed), 2);
+
+        alice_peer
+            .close()
+            .await
+            .unwrap_or_else(|error| panic!("closing Alice peer: {error}"));
+        bob_peer
+            .close()
+            .await
+            .unwrap_or_else(|error| panic!("closing Bob peer: {error}"));
+        alice.close().await;
+        bob.close().await;
+        relay
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("stopping relay: {error}"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1897,6 +2322,28 @@ mod tests {
                 .unwrap_or_else(|error| panic!("matching relays: {error}"))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn path_policy_requires_matching_acknowledgement_and_transport_settings() {
+        let relay = IrohRelayConfig::new(
+            Url::parse("https://trusted.invalid/")
+                .unwrap_or_else(|error| panic!("trusted URL: {error}")),
+        );
+        let mut mismatched = V3ClientConfig::relay_only(
+            PublicContactDisclosure::AcknowledgePreConsentNetworkExposure,
+            vec![TEST_APPLICATION.to_owned()],
+        );
+        mismatched.trusted_relays = vec![relay.clone()];
+        assert!(mismatched.validate().is_err());
+
+        let mut relay_with_udp = V3ClientConfig::relay_only(
+            PublicContactDisclosure::AcknowledgePreConsentRelayMetadataExposure,
+            vec![TEST_APPLICATION.to_owned()],
+        );
+        relay_with_udp.trusted_relays = vec![relay];
+        relay_with_udp.udp_bind_addresses = vec![SocketAddr::from(([127, 0, 0, 1], 0))];
+        assert!(relay_with_udp.validate().is_err());
     }
 
     #[test]

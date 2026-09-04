@@ -1637,7 +1637,7 @@ name = "hole-punchky"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "hole-punchky-client",
  "hole-punchky-protocol",
@@ -1658,7 +1658,7 @@ name = "hole-punchky-client"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "fs2",
  "futures-util",
  "hole-punchky-protocol",
@@ -1683,7 +1683,7 @@ dependencies = [
 name = "hole-punchky-protocol"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "ed25519-dalek",
  "hpke",
  "pubky-common",

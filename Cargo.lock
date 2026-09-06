@@ -3231,7 +3231,7 @@ name = "pubky2pubky-browser-wasm"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "futures-util",
  "js-sys",
  "n0-future",
@@ -3253,7 +3253,7 @@ name = "pubky2pubky-client"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "fs2",
  "futures-util",
  "iroh",
@@ -3275,7 +3275,7 @@ dependencies = [
 name = "pubky2pubky-protocol"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "ed25519-dalek",
  "pubky-common",
  "serde",

@@ -11,6 +11,9 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O", "--strip-producers"]
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 async-trait.workspace = true
 base64.workspace = true

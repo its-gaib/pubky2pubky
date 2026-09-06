@@ -19,5 +19,6 @@ Only literal `127.0.0.1` or `[::1]` HTTP relay URLs with explicit ports are acce
 the explicit testnet configuration is present. Production relay URLs must use HTTPS.
 
 The generated JavaScript, Wasm, declarations, and security-critical storage snippet are committed
-so applications can pin a Git commit. Run `npm run build:browser` to reproduce them and
-`npm run check:browser-artifact` to verify the complete artifact manifest.
+so applications can pin a Git commit. On Linux x86_64, run `npm run setup:browser-toolchain` once,
+then `npm run build:browser` to reproduce them and `npm run check:browser-artifact` to verify the
+complete artifact manifest.

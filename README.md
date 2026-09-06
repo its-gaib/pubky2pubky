@@ -29,15 +29,18 @@ Build and verify the committed browser artifact:
 
 ```bash
 npm ci
+npm run setup:browser-toolchain
 npm run build:browser
 npm run check:browser-artifact
 npm run test:browser
 ```
 
 The generated JavaScript, Wasm, declarations, and storage snippet are committed so applications
-can pin an immutable Git commit. A browser build is relay-only because browsers do not expose the
-UDP primitives Iroh uses for direct path discovery. Native users of `pubky2pubky-client` may enable
-relay-assisted UDP hole punching.
+can pin an immutable Git commit. The reproducible artifact build currently runs on Linux x86_64;
+its setup command installs checksum-verified WASI SDK and Binaryen archives in the user's cache.
+A browser build is relay-only because browsers do not expose the UDP primitives Iroh uses for
+direct path discovery. Native users of `pubky2pubky-client` may enable relay-assisted UDP hole
+punching.
 
 ## Rust workspace
 

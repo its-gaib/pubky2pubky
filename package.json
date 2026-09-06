@@ -17,6 +17,7 @@
     "node": ">=20.19"
   },
   "scripts": {
+    "setup:browser-toolchain": "bash scripts/install-browser-toolchain.sh",
     "build:browser": "bash scripts/build-browser.sh",
     "check:browser-artifact": "bash scripts/check-browser-artifact.sh",
     "test:browser": "node --test packages/browser/test/*.test.js"

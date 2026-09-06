@@ -15,7 +15,7 @@ repository = "https://github.com/its-gaib/pubky2pubky"
 
 [workspace.dependencies]
 async-trait = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 ed25519-dalek = "3.0"
 futures-util = "0.3"
 iroh = { version = "=1.1.0", default-features = false, features = ["portmapper", "tls-ring"] }

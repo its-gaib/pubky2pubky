@@ -1,6 +1,6 @@
 [package]
 name = "pubky2pubky-browser-wasm"
-description = "Browser bindings for Pubky delegated auth and pubky2pubky v4"
+description = "Browser bindings for Pubky delegated auth and pubky2pubky v1"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,8 +15,8 @@ crate-type = ["cdylib", "rlib"]
 async-trait.workspace = true
 base64.workspace = true
 futures-util.workspace = true
-hole-punchky-client = { path = "../client" }
-hole-punchky-protocol = { path = "../protocol" }
+pubky2pubky-client = { path = "../client" }
+pubky2pubky-protocol = { path = "../protocol" }
 js-sys = "0.3"
 n0-future.workspace = true
 pubky.workspace = true

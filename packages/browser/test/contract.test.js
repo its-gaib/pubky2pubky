@@ -157,7 +157,7 @@ test("mocked core proves publication before success and holds the per-account le
     finishPublish();
     await goingOnline;
     assert.equal(events.some((event) => event.type === "online-state" && event.online), true);
-    assert.equal(lockNames[0], `pubky2pubky:v4:network-leader:${"y".repeat(52)}`);
+    assert.equal(lockNames[0], `pubky2pubky:network-leader:${"y".repeat(52)}`);
 
     await assert.rejects(
       second.publishAndGoOnline(),

@@ -26,6 +26,33 @@ const control = "n".repeat(52);
 before(async () => store.__p2pTestReset());
 afterEach(async () => store.__p2pTestReset());
 
+test("does not load or promote unpublished prototype browser state", async () => {
+  const oldDatabase = await new Promise((resolve, reject) => {
+    const request = indexedDB.open("pubky2pubky-browser-v1", 1);
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore("identities", { keyPath: "identity" });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  const transaction = oldDatabase.transaction("identities", "readwrite");
+  transaction.objectStore("identities").put({ identity: alice, version: 1 });
+  await new Promise((resolve, reject) => {
+    transaction.oncomplete = resolve;
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
+  });
+  oldDatabase.close();
+
+  assert.deepEqual(await store.__p2pListIdentities(), []);
+
+  await new Promise((resolve, reject) => {
+    const request = indexedDB.deleteDatabase("pubky2pubky-browser-v1");
+    request.onsuccess = resolve;
+    request.onerror = () => reject(request.error);
+  });
+});
+
 test("delegated signing key is nonextractable and restore/device plaintext is sealed", async () => {
   const grantKey = await store.__p2pEnsureGrantKey();
   assert.equal(grantKey.publicKey.byteLength, 32);
@@ -119,6 +146,15 @@ test("an expired Grant record can be atomically reauthorized without retaining i
 
 test("publisher allocation is positive, monotonic, and cannot silently reinitialize", async () => {
   await store.__p2pInitializePublisher(alice, alice, control);
+  await assert.rejects(
+    store.__p2pRecordSequenceBatch(alice, [{
+      identity: alice,
+      scope: `v1:publisher:${control}`,
+      counter: 99,
+      digest: "P".repeat(43),
+    }]),
+    /sequence-invalid/u,
+  );
   assert.equal(await store.__p2pNextPublisherSequence(alice, alice, control), 1);
   assert.equal(await store.__p2pNextPublisherSequence(alice, alice, control), 2);
   await assert.rejects(

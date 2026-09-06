@@ -9,9 +9,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 cargo audit
 npm ci --ignore-scripts
-npm run lint:schemas
+npm run build:browser
+npm run check:browser-artifact
+npm run test:browser
 shellcheck scripts/*.sh
-
-if [[ "${HPK_TEST_CONTAINERS:-0}" == "1" ]]; then
-  "$repo_dir/scripts/container-smoke.sh"
-fi

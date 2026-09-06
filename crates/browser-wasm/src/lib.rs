@@ -1,4 +1,4 @@
-//! Browser-only Pubky delegated authentication and protected v4 device state.
+//! Browser-only Pubky delegated authentication and protected v1 device state.
 
 #![cfg(target_arch = "wasm32")]
 #![allow(
@@ -19,19 +19,19 @@ use std::{
 
 use browser_store::{IdentityToStore, StoredIdentity};
 use futures_util::future::{AbortHandle, Abortable};
-use hole_punchky_client::{
-    ConnectionPath, IncomingV4, IrohRelayConfig, Peer, PubkyV4Resolver, PublicContactDisclosure,
-    V4Client, V4ClientConfig, V4DeviceResolver, V4DiscoveryConfig, delete_v4_device_record,
-    publish_v4_device_record,
-};
-use hole_punchky_protocol::{
-    V4_IROH_ALPN_TEXT, V4DeviceCredential, V4GrantAuthorization, now_seconds,
-};
 use pubky::{
     AuthFlowKind, Capabilities, ClientId, DelegatedGrantCredentialState, Pubky, PubkyGrantAuthFlow,
     PubkyHttpClient, PubkySession, PublicKey,
 };
 use pubky_common::auth::grant_session_responses::GrantSessionInfo;
+use pubky2pubky_client::{
+    ConnectionPath, IncomingV1, IrohRelayConfig, Peer, PubkyV1Resolver, PublicContactDisclosure,
+    V1Client, V1ClientConfig, V1DeviceResolver, V1DiscoveryConfig, delete_v1_device_record,
+    publish_v1_device_record,
+};
+use pubky2pubky_protocol::{
+    V1_IROH_ALPN_TEXT, V1DeviceCredential, V1GrantAuthorization, now_seconds,
+};
 use serde::{Deserialize, Serialize};
 use url::Url;
 use wasm_bindgen::prelude::*;
@@ -50,7 +50,7 @@ const MAX_CONNECTED_PEERS: usize = 16;
 const MAX_PENDING_INBOUND: usize = 16;
 const MAX_PENDING_PER_IDENTITY: usize = 2;
 const MAX_CHAT_BYTES: usize = 4 * 1024;
-const APPLICATION: &str = "pubky2pubky/chat/4";
+const APPLICATION: &str = "pubky2pubky/chat/1";
 const LOCATOR_LIFETIME: Duration = Duration::from_mins(15);
 const LOCATOR_RENEW_AFTER: Duration = Duration::from_mins(5);
 const PATH_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -78,12 +78,12 @@ struct BrowserState {
     key_id: Option<String>,
     identity: Option<String>,
     client_id: Option<String>,
-    device: Option<V4DeviceCredential>,
+    device: Option<V1DeviceCredential>,
     sequence_store: Option<Arc<browser_store::BrowserSequenceStore>>,
-    client: Option<V4Client>,
-    current_record: Option<hole_punchky_protocol::V4DeviceRecord>,
+    client: Option<V1Client>,
+    current_record: Option<pubky2pubky_protocol::V1DeviceRecord>,
     peers: HashMap<String, Rc<Peer>>,
-    pending_inbound: HashMap<String, IncomingV4>,
+    pending_inbound: HashMap<String, IncomingV1>,
     dialing: HashSet<String>,
     going_online: bool,
     epoch: u64,
@@ -153,7 +153,7 @@ struct RestoreState {
     client_pk: String,
 }
 
-/// Browser-owned authentication, device-state, and v4 relay-only network core.
+/// Browser-owned authentication, device-state, and v1 relay-only network core.
 #[wasm_bindgen]
 pub struct BrowserCore {
     state: Rc<RefCell<BrowserState>>,
@@ -330,7 +330,7 @@ impl BrowserCore {
                 key_id: restore.key_id.clone(),
                 client_pk: restore.client_pk.z32(),
             };
-            V4GrantAuthorization::from_jws(&restore.grant_jws, &identity, now_seconds())
+            V1GrantAuthorization::from_jws(&restore.grant_jws, &identity, now_seconds())
                 .map_err(|_| failure("identity-verification-failed"))?;
             if !auth_epoch_is(&self.state, pending.epoch) {
                 return Err(failure("session-closed"));
@@ -460,7 +460,7 @@ impl BrowserCore {
             if stored_public_key != client_pk {
                 return Err(failure("storage-tampered"));
             }
-            V4GrantAuthorization::from_jws(&restore.grant_jws, &identity, now_seconds())
+            V1GrantAuthorization::from_jws(&restore.grant_jws, &identity, now_seconds())
                 .map_err(|_| failure("identity-verification-failed"))?;
             let delegated = DelegatedGrantCredentialState {
                 grant_jws: restore.grant_jws,
@@ -556,7 +556,7 @@ impl BrowserCore {
         Ok(removed)
     }
 
-    /// Prepare or restore the protected v4 device credential. This does not claim network success.
+    /// Prepare or restore the protected v1 device credential. This does not claim network success.
     #[wasm_bindgen(js_name = prepareDevice)]
     pub async fn prepare_device(&self, device_id: String) -> BrowserResult<JsValue> {
         let (session, key_id, identity, had_cached_device, network_active) = {
@@ -586,7 +586,7 @@ impl BrowserCore {
             browser_store::load_device_state(&identity).await?
         {
             let encoded = Zeroizing::new(encoded);
-            let device: V4DeviceCredential =
+            let device: V1DeviceCredential =
                 serde_json::from_str(&encoded).map_err(|_| failure("storage-tampered"))?;
             if device.identity() != identity {
                 return Err(failure("storage-tampered"));
@@ -688,15 +688,15 @@ impl BrowserCore {
             (device, pubky, session, sequences, state.epoch)
         };
 
-        let discovery_config = V4DiscoveryConfig {
+        let discovery_config = V1DiscoveryConfig {
             allow_insecure_loopback_relay: allow_loopback_testnet,
-            ..V4DiscoveryConfig::default()
+            ..V1DiscoveryConfig::default()
         };
-        let resolver: Arc<dyn V4DeviceResolver> = Arc::new(
-            PubkyV4Resolver::new(pubky, session.clone(), sequences.clone())
+        let resolver: Arc<dyn V1DeviceResolver> = Arc::new(
+            PubkyV1Resolver::new(pubky, session.clone(), sequences.clone())
                 .with_config(discovery_config),
         );
-        let mut config = V4ClientConfig::relay_only(
+        let mut config = V1ClientConfig::relay_only(
             PublicContactDisclosure::AcknowledgePreConsentRelayMetadataExposure,
             vec![APPLICATION.to_owned()],
         );
@@ -706,7 +706,7 @@ impl BrowserCore {
         config.max_message_bytes = MAX_CHAT_BYTES;
 
         let setup = async {
-            let client = V4Client::bind(device, resolver, config)
+            let client = V1Client::bind(device, resolver, config)
                 .await
                 .map_err(|_| failure("relay-unreachable"))?;
             let locator_lifetime = bounded_locator_lifetime(client.credential())?;
@@ -717,7 +717,7 @@ impl BrowserCore {
                 client.close().await;
                 return Err(failure("publication-failed"));
             };
-            if publish_v4_device_record(&session, &record, allow_loopback_testnet)
+            if publish_v1_device_record(&session, &record, allow_loopback_testnet)
                 .await
                 .is_err()
             {
@@ -752,7 +752,7 @@ impl BrowserCore {
             }
         };
         if stale {
-            let _ = delete_v4_device_record(&session, &record).await;
+            let _ = delete_v1_device_record(&session, &record).await;
             client.close().await;
             return Err(failure("session-closed"));
         }
@@ -775,7 +775,7 @@ impl BrowserCore {
         to_js(&OnlineResult {
             identity: client.identity().to_owned(),
             device_id: client.device_id().to_owned(),
-            alpn: V4_IROH_ALPN_TEXT,
+            alpn: V1_IROH_ALPN_TEXT,
             path: "relay",
             e2e: true,
         })
@@ -924,7 +924,7 @@ fn auth_epoch_is(state: &Rc<RefCell<BrowserState>>, expected: u64) -> bool {
 fn start_incoming_loop(
     state: Rc<RefCell<BrowserState>>,
     on_event: Rc<js_sys::Function>,
-    client: V4Client,
+    client: V1Client,
     epoch: u64,
 ) {
     spawn_local(async move {
@@ -1019,7 +1019,7 @@ fn start_inbound_expiry(
 fn start_renewal_loop(
     state: Rc<RefCell<BrowserState>>,
     on_event: Rc<js_sys::Function>,
-    client: V4Client,
+    client: V1Client,
     session: PubkySession,
     sequences: Arc<browser_store::BrowserSequenceStore>,
     allow_loopback_testnet: bool,
@@ -1043,7 +1043,7 @@ fn start_renewal_loop(
                 fail_online_endpoint(&state, &on_event, &client, &session, epoch).await;
                 break;
             };
-            if publish_v4_device_record(&session, &record, allow_loopback_testnet)
+            if publish_v1_device_record(&session, &record, allow_loopback_testnet)
                 .await
                 .is_err()
             {
@@ -1060,7 +1060,7 @@ fn start_renewal_loop(
                 }
             };
             if !active {
-                let _ = delete_v4_device_record(&session, &record).await;
+                let _ = delete_v1_device_record(&session, &record).await;
                 break;
             }
         }
@@ -1073,7 +1073,7 @@ fn start_renewal_loop(
 async fn fail_online_endpoint(
     state: &Rc<RefCell<BrowserState>>,
     on_event: &js_sys::Function,
-    client: &V4Client,
+    client: &V1Client,
     session: &PubkySession,
     epoch: u64,
 ) {
@@ -1105,7 +1105,7 @@ async fn fail_online_endpoint(
     }
     client.close().await;
     if let Some(record) = record {
-        let _ = delete_v4_device_record(session, &record).await;
+        let _ = delete_v1_device_record(session, &record).await;
     }
     for (peer_id, _) in peers {
         emit_json(
@@ -1167,8 +1167,8 @@ async fn activate_peer(
             "e2e": true,
             "irohQuicEncrypted": true,
             "pubkyIdentityVerified": true,
-            "protocolVersion": 4,
-            "alpn": V4_IROH_ALPN_TEXT,
+            "protocolVersion": 1,
+            "alpn": V1_IROH_ALPN_TEXT,
         }),
     );
     start_receive_loop(
@@ -1183,7 +1183,7 @@ async fn activate_peer(
         peer_device_id,
         path: "relay",
         e2e: true,
-        alpn: V4_IROH_ALPN_TEXT,
+        alpn: V1_IROH_ALPN_TEXT,
     })
 }
 
@@ -1270,7 +1270,7 @@ async fn shutdown_network(state: Rc<RefCell<BrowserState>>) {
         client.close().await;
     }
     if let (Some(record), Some(session)) = (record, session) {
-        let _ = delete_v4_device_record(&session, &record).await;
+        let _ = delete_v1_device_record(&session, &record).await;
     }
 }
 
@@ -1299,7 +1299,7 @@ async fn issue_device(
     identity: &str,
     device_id: String,
     now: u64,
-) -> BrowserResult<V4DeviceCredential> {
+) -> BrowserResult<V1DeviceCredential> {
     let grant = session
         .as_grant()
         .ok_or_else(|| failure("identity-verification-failed"))?;
@@ -1312,7 +1312,7 @@ async fn issue_device(
     {
         return Err(failure("identity-verification-failed"));
     }
-    let authorization = V4GrantAuthorization::from_jws(&restore.grant_jws, identity, now)
+    let authorization = V1GrantAuthorization::from_jws(&restore.grant_jws, identity, now)
         .map_err(|_| failure("identity-verification-failed"))?;
     let claims = authorization
         .verify(identity, now)
@@ -1322,7 +1322,7 @@ async fn issue_device(
         .map(|expiry| expiry.min(claims.exp))
         .filter(|expiry| *expiry > now)
         .ok_or_else(|| failure("identity-verification-failed"))?;
-    let draft = V4DeviceCredential::prepare(authorization, identity, device_id, now, expires_at)
+    let draft = V1DeviceCredential::prepare(authorization, identity, device_id, now, expires_at)
         .map_err(|_| failure("device-state-invalid"))?;
     let signature = browser_store::sign_certificate(
         key_id,
@@ -1481,17 +1481,17 @@ fn canonical_public_key(value: &str) -> BrowserResult<PublicKey> {
     Ok(key)
 }
 
-fn device_result(device: &V4DeviceCredential) -> BrowserResult<JsValue> {
+fn device_result(device: &V1DeviceCredential) -> BrowserResult<JsValue> {
     to_js(&DeviceResult {
         identity: device.identity().to_owned(),
         device_id: device.device_id().to_owned(),
         control_signing_key: device.control_signing_key().to_owned(),
         iroh_endpoint_id: device.iroh_endpoint_id().to_owned(),
-        alpn: V4_IROH_ALPN_TEXT,
+        alpn: V1_IROH_ALPN_TEXT,
     })
 }
 
-fn bounded_locator_lifetime(device: &V4DeviceCredential) -> BrowserResult<Duration> {
+fn bounded_locator_lifetime(device: &V1DeviceCredential) -> BrowserResult<Duration> {
     let remaining = device
         .certificate
         .claims

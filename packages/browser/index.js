@@ -6,7 +6,7 @@ const MAX_MESSAGE_BYTES = 4_096;
 const MAX_RELAYS = 4;
 const MAX_AUTHORIZATION_URL_BYTES = 8 * 1_024;
 const MAX_EVENT_CLOCK_DRIFT_MS = 5 * 60 * 1_000;
-const ALPN = "pubky2pubky/iroh/v4";
+const ALPN = "pubky2pubky/iroh/v1";
 const ERROR_CODES = new Set([
   "another-tab-online",
   "authentication-required",
@@ -328,7 +328,7 @@ class BrowserTransport {
     let lockFailure = false;
     try {
       this.#leaderCompletion = navigator.locks.request(
-        `pubky2pubky:v4:network-leader:${requirePubky(this.#identity)}`,
+        `pubky2pubky:network-leader:${requirePubky(this.#identity)}`,
         { mode: "exclusive", ifAvailable: true },
         async (lock) => {
           announce(lock !== null);
@@ -379,7 +379,7 @@ class BrowserTransport {
     let operationError;
     try {
       await navigator.locks.request(
-        `pubky2pubky:v4:network-leader:${requirePubky(identity)}`,
+        `pubky2pubky:network-leader:${requirePubky(identity)}`,
         { mode: "exclusive", ifAvailable: true },
         async (lock) => {
           if (lock === null) return;
@@ -519,7 +519,7 @@ function normalizeCoreEvent(event) {
       const id = requireRequestId(event.id);
       const peerId = requirePubky(event.peerId);
       const peerDeviceId = requireBoundedText(event.peerDeviceId, 64, "internal-error");
-      if (event.application !== "pubky2pubky/chat/4" || !isLocalTimestamp(event.receivedAt)) {
+      if (event.application !== "pubky2pubky/chat/1" || !isLocalTimestamp(event.receivedAt)) {
         throw typed("internal-error");
       }
       return {
@@ -541,7 +541,7 @@ function normalizeCoreEvent(event) {
         event.e2e !== true ||
         event.irohQuicEncrypted !== true ||
         event.pubkyIdentityVerified !== true ||
-        event.protocolVersion !== 4 ||
+        event.protocolVersion !== 1 ||
         event.alpn !== ALPN
       ) {
         throw typed("internal-error");
@@ -555,7 +555,7 @@ function normalizeCoreEvent(event) {
         e2e: true,
         irohQuicEncrypted: true,
         pubkyIdentityVerified: true,
-        protocolVersion: 4,
+        protocolVersion: 1,
         alpn: ALPN,
       };
     }

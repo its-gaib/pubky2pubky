@@ -1,7 +1,7 @@
 {
   "name": "pubky2pubky-browser-wasm",
   "type": "module",
-  "description": "Browser bindings for Pubky delegated auth and pubky2pubky v4",
+  "description": "Browser bindings for Pubky delegated auth and pubky2pubky v1",
   "version": "0.1.0",
   "license": "MIT",
   "repository": {

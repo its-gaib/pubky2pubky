@@ -1,7 +1,0 @@
-.git
-.github
-target
-**/target
-*.key.json
-.env
-deploy/.env

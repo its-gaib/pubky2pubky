@@ -1,7 +1,9 @@
 // Browser-only key and state storage. This module is copied into wasm-bindgen's generated
 // snippets and is also imported directly by the storage contract tests.
 
-const DB_NAME = "pubky2pubky-browser-v1";
+// This fresh namespace deliberately does not open the unpublished pre-v1 database. Protocol-v1
+// device keys and anti-rollback state must be generated from scratch, never relabeled.
+const DB_NAME = "pubky2pubky-browser-protocol-v1";
 const DB_VERSION = 1;
 const GRANT_KEYS = "grantKeys";
 const IDENTITIES = "identities";
@@ -156,7 +158,7 @@ async function ensureEncryptionKey(identity) {
 function associatedData(purpose, identity, clientId, keyId) {
   return new TextEncoder().encode(
     [
-      "pubky2pubky-browser-state-v1",
+      "pubky2pubky-browser-protocol-v1-state-v1",
       purpose,
       location.origin,
       identity,
@@ -479,14 +481,14 @@ export async function __p2pSaveNewDeviceState(identity, controlKey, plaintext) {
   const encrypted = await seal(
     encryptionKey,
     state,
-    associatedData("device", account, "v4", control),
+    associatedData("device", account, "v1", control),
   );
-  const sequenceKey = `${account}\u0000${account}\u0000publisher:${control}`;
+  const sequenceKey = `${account}\u0000${account}\u0000v1:publisher:${control}`;
   const publisher = {
     key: sequenceKey,
     accountId: account,
     identity: account,
-    scope: `publisher:${control}`,
+    scope: `v1:publisher:${control}`,
     kind: "publisher",
     counter: 0,
     digest: null,
@@ -539,14 +541,14 @@ export async function __p2pReplaceDeviceState(identity, oldControlKey, newContro
   const encrypted = await seal(
     encryptionKey,
     state,
-    associatedData("device", account, "v4", newControl),
+    associatedData("device", account, "v1", newControl),
   );
-  const sequenceKey = `${account}\u0000${account}\u0000publisher:${newControl}`;
+  const sequenceKey = `${account}\u0000${account}\u0000v1:publisher:${newControl}`;
   const publisher = {
     key: sequenceKey,
     accountId: account,
     identity: account,
-    scope: `publisher:${newControl}`,
+    scope: `v1:publisher:${newControl}`,
     kind: "publisher",
     counter: 0,
     digest: null,
@@ -611,7 +613,7 @@ export async function __p2pLoadDeviceState(identity) {
     return await unseal(
       keyRecord.key,
       record,
-      associatedData("device", account, "v4", record.controlKey),
+      associatedData("device", account, "v1", record.controlKey),
     );
   } finally {
     database.close();
@@ -622,7 +624,7 @@ export async function __p2pHasPublisherSequence(accountId, identity, controlKey)
   const account = validateIdentity(accountId);
   const owner = validateIdentity(identity);
   const control = validateIdentity(controlKey);
-  const key = sequenceKey(account, owner, `publisher:${control}`);
+  const key = sequenceKey(account, owner, `v1:publisher:${control}`);
   const record = await readOne(SEQUENCES, key);
   if (record === undefined) return false;
   validateStoredSequence(record);
@@ -674,8 +676,8 @@ function sequenceKey(accountId, identity, scope) {
 
 function validateScope(scope) {
   if (typeof scope !== "string" || !SCOPE.test(scope)) throw failure("sequence-invalid");
-  if (scope.startsWith("publisher:")) {
-    const control = scope.slice("publisher:".length);
+  if (scope.startsWith("v1:publisher:")) {
+    const control = scope.slice("v1:publisher:".length);
     if (!Z32.test(control)) throw failure("sequence-invalid");
   }
   return scope;
@@ -697,6 +699,7 @@ function validateObservation(accountId, observation) {
   if (observation === null || typeof observation !== "object") throw failure("sequence-invalid");
   const identity = validateIdentity(observation.identity);
   const scope = validateScope(observation.scope);
+  if (scope.startsWith("v1:publisher:")) throw failure("sequence-invalid");
   const counter = validateCounter(observation.counter);
   const digest = validateDigest(observation.digest);
   return {
@@ -718,8 +721,14 @@ function validateStoredSequence(record) {
     !Z32.test(record.accountId) ||
     !Z32.test(record.identity) ||
     !SCOPE.test(record.scope) ||
-    !["publisher", "legacy", "authenticated"].includes(record.kind)
+    !["publisher", "authenticated"].includes(record.kind)
   ) {
+    throw failure("storage-tampered");
+  }
+  if (record.kind === "publisher" && !record.scope.startsWith("v1:publisher:")) {
+    throw failure("storage-tampered");
+  }
+  if (record.kind === "authenticated" && record.scope.startsWith("v1:publisher:")) {
     throw failure("storage-tampered");
   }
   validateCounter(record.counter, record.kind === "publisher");
@@ -783,7 +792,7 @@ export async function __p2pInitializePublisher(accountId, identity, controlKey) 
   const account = validateIdentity(accountId);
   const owner = validateIdentity(identity);
   const control = validateIdentity(controlKey);
-  const scope = `publisher:${control}`;
+  const scope = `v1:publisher:${control}`;
   const key = sequenceKey(account, owner, scope);
   await updateSequences((current) => {
     if (current.has(key)) throw failure("publisher-already-initialized");
@@ -805,7 +814,7 @@ export async function __p2pNextPublisherSequence(accountId, identity, controlKey
   const account = validateIdentity(accountId);
   const owner = validateIdentity(identity);
   const control = validateIdentity(controlKey);
-  const key = sequenceKey(account, owner, `publisher:${control}`);
+  const key = sequenceKey(account, owner, `v1:publisher:${control}`);
   let next;
   await updateSequences((current) => {
     const record = current.get(key);
@@ -817,32 +826,6 @@ export async function __p2pNextPublisherSequence(accountId, identity, controlKey
     return [updated];
   });
   return next;
-}
-
-export async function __p2pRecordLegacySequence(accountId, identity, scope, counter) {
-  const account = validateIdentity(accountId);
-  const owner = validateIdentity(identity);
-  const normalizedScope = validateScope(scope);
-  const value = validateCounter(counter);
-  const key = sequenceKey(account, owner, normalizedScope);
-  await updateSequences((current) => {
-    const previous = current.get(key);
-    if (previous && value < previous.counter) throw failure("sequence-rollback");
-    if (previous?.kind === "authenticated" && value === previous.counter) {
-      throw failure("sequence-digest-required");
-    }
-    const updated = {
-      key,
-      accountId: account,
-      identity: owner,
-      scope: normalizedScope,
-      kind: "legacy",
-      counter: value,
-      digest: null,
-    };
-    current.set(key, updated);
-    return [updated];
-  });
 }
 
 export async function __p2pRecordSequenceBatch(accountId, observations) {
@@ -869,11 +852,9 @@ export async function __p2pRecordSequenceBatch(accountId, observations) {
     // Validate the complete batch before mutating the staged map.
     for (const observation of prepared.values()) {
       const previous = current.get(observation.key);
+      if (previous?.kind === "publisher") throw failure("sequence-invalid");
       if (previous && observation.counter < previous.counter) {
         throw failure("sequence-rollback");
-      }
-      if (previous?.kind === "legacy" && observation.counter === previous.counter) {
-        throw failure("sequence-digest-required");
       }
       if (
         previous?.kind === "authenticated" &&

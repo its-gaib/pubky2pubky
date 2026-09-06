@@ -1,4 +1,4 @@
-//! Grant-authorized iroh QUIC peer transport for protocol v4.
+//! Grant-authorized iroh QUIC peer transport for protocol v1.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -9,13 +9,6 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::FutureExt as _;
-use hole_punchky_protocol::{
-    V4_IROH_ALPN, V4_MAX_ACK_BYTES, V4_MAX_CURRENTNESS_LIFETIME_SECONDS,
-    V4_MAX_HANDSHAKE_LIFETIME_SECONDS, V4_MAX_HELLO_BYTES, V4_MAX_LOCATOR_LIFETIME_SECONDS,
-    V4_PROTOCOL_VERSION, V4CurrentnessRole, V4DeviceCredential, V4DeviceRecord, V4SignedAck,
-    V4SignedCurrentnessProof, V4SignedHello, V4SignedLocator, now_seconds, v4_currentness_path,
-    v4_random_challenge,
-};
 #[cfg(not(target_arch = "wasm32"))]
 use iroh::tls::CaTlsConfig;
 use iroh::{
@@ -27,6 +20,13 @@ use n0_future::{
     task::{JoinHandle, spawn},
     time::{self, Instant},
 };
+use pubky2pubky_protocol::{
+    V1_IROH_ALPN, V1_MAX_ACK_BYTES, V1_MAX_CURRENTNESS_LIFETIME_SECONDS,
+    V1_MAX_HANDSHAKE_LIFETIME_SECONDS, V1_MAX_HELLO_BYTES, V1_MAX_LOCATOR_LIFETIME_SECONDS,
+    V1_PROTOCOL_VERSION, V1CurrentnessRole, V1DeviceCredential, V1DeviceRecord, V1SignedAck,
+    V1SignedCurrentnessProof, V1SignedHello, V1SignedLocator, now_seconds, v1_currentness_path,
+    v1_random_challenge,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use tracing::debug;
@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 use crate::{
     ClientError, IrohRelayConfig, PathPolicy, Peer, PublicContactDisclosure,
-    PublisherSequenceStore, ResolvedV4Device, Result, V4DeviceResolver,
+    PublisherSequenceStore, ResolvedV1Device, Result, V1DeviceResolver,
 };
 
 const MAX_APPLICATIONS: usize = 16;
@@ -51,9 +51,9 @@ const MAX_TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_PROOF_CONTROL_BYTES: usize = 4 * 1024;
 const MAX_ACTIVE_RECORDS: usize = 8;
 
-/// V4 endpoint, relay, handshake, consent, and resource policy.
+/// V1 endpoint, relay, handshake, consent, and resource policy.
 #[derive(Debug, Clone)]
-pub struct V4ClientConfig {
+pub struct V1ClientConfig {
     /// Whether this endpoint may use direct IP paths or is constrained to an iroh relay.
     pub path_policy: PathPolicy,
     /// Locally trusted exact iroh relay origins. Remote locators can only select this set.
@@ -84,12 +84,12 @@ pub struct V4ClientConfig {
     pub replay_cache_capacity: usize,
     /// Maximum replay entries retained for one Pubky identity.
     pub replay_cache_per_identity_capacity: usize,
-    /// Exact application identifiers accepted on inbound v4 connections.
+    /// Exact application identifiers accepted on inbound v1 connections.
     pub accepted_applications: Vec<String>,
     disclosure: PublicContactDisclosure,
 }
 
-impl V4ClientConfig {
+impl V1ClientConfig {
     /// Construct native direct-with-relay-fallback policy after explicit privacy acknowledgement.
     #[must_use]
     pub fn direct(disclosure: PublicContactDisclosure, accepted_applications: Vec<String>) -> Self {
@@ -170,7 +170,7 @@ impl V4ClientConfig {
             ) => {}
             _ => {
                 return Err(ClientError::Iroh(
-                    "v4 path policy does not match its privacy acknowledgement".to_owned(),
+                    "v1 path policy does not match its privacy acknowledgement".to_owned(),
                 ));
             }
         }
@@ -178,7 +178,7 @@ impl V4ClientConfig {
         self.validate_browser_constraints()?;
         if self.trusted_relays.is_empty() || self.trusted_relays.len() > MAX_TRUSTED_RELAYS {
             return Err(ClientError::Iroh(
-                "v4 requires one to four locally trusted relays".to_owned(),
+                "v1 requires one to four locally trusted relays".to_owned(),
             ));
         }
         let mut relay_origins = HashSet::new();
@@ -186,7 +186,7 @@ impl V4ClientConfig {
             validate_trusted_relay_url(&relay.url, self.allow_insecure_loopback_relay)?;
             if !relay_origins.insert(origin(&relay.url)?) {
                 return Err(ClientError::Iroh(
-                    "duplicate v4 trusted relay origin".to_owned(),
+                    "duplicate v1 trusted relay origin".to_owned(),
                 ));
             }
             if relay
@@ -195,7 +195,7 @@ impl V4ClientConfig {
                 .is_some_and(|token| token.is_empty() || token.len() > MAX_AUTH_TOKEN_BYTES)
             {
                 return Err(ClientError::Iroh(
-                    "invalid local v4 relay authentication token".to_owned(),
+                    "invalid local v1 relay authentication token".to_owned(),
                 ));
             }
         }
@@ -205,14 +205,14 @@ impl V4ClientConfig {
             })
         {
             return Err(ClientError::Iroh(
-                "invalid local v4 relay CA certificate set".to_owned(),
+                "invalid local v1 relay CA certificate set".to_owned(),
             ));
         }
         match self.path_policy {
             PathPolicy::DirectWithRelayFallback => {
                 if self.udp_bind_addresses.is_empty() || self.udp_bind_addresses.len() > 2 {
                     return Err(ClientError::Iroh(
-                        "v4 direct mode requires one or two UDP bind addresses".to_owned(),
+                        "v1 direct mode requires one or two UDP bind addresses".to_owned(),
                     ));
                 }
                 let mut families = HashSet::new();
@@ -222,13 +222,13 @@ impl V4ClientConfig {
                     .any(|address| !families.insert(address.is_ipv4()))
                 {
                     return Err(ClientError::Iroh(
-                        "v4 accepts at most one UDP bind per IP family".to_owned(),
+                        "v1 accepts at most one UDP bind per IP family".to_owned(),
                     ));
                 }
             }
             PathPolicy::RelayOnly if !self.udp_bind_addresses.is_empty() => {
                 return Err(ClientError::Iroh(
-                    "v4 relay-only mode forbids UDP bind addresses".to_owned(),
+                    "v1 relay-only mode forbids UDP bind addresses".to_owned(),
                 ));
             }
             PathPolicy::RelayOnly => {}
@@ -250,14 +250,14 @@ impl V4ClientConfig {
             || !(1..=self.replay_cache_capacity).contains(&self.replay_cache_per_identity_capacity)
         {
             return Err(ClientError::Iroh(
-                "invalid v4 client resource bounds".to_owned(),
+                "invalid v1 client resource bounds".to_owned(),
             ));
         }
         if self.accepted_applications.is_empty()
             || self.accepted_applications.len() > MAX_APPLICATIONS
         {
             return Err(ClientError::Iroh(
-                "v4 requires a bounded inbound application allowlist".to_owned(),
+                "v1 requires a bounded inbound application allowlist".to_owned(),
             ));
         }
         let mut applications = HashSet::new();
@@ -265,7 +265,7 @@ impl V4ClientConfig {
             validate_application(application)?;
             if !applications.insert(application) {
                 return Err(ClientError::Iroh(
-                    "duplicate v4 inbound application".to_owned(),
+                    "duplicate v1 inbound application".to_owned(),
                 ));
             }
         }
@@ -283,7 +283,7 @@ impl V4ClientConfig {
             || self.max_message_bytes > MAX_BROWSER_MESSAGE_BYTES
         {
             return Err(ClientError::Iroh(
-                "browser v4 requires relay-only transport without tokens, custom CAs, or oversized messages"
+                "browser v1 requires relay-only transport without tokens, custom CAs, or oversized messages"
                     .to_owned(),
             ));
         }
@@ -317,37 +317,37 @@ impl Drop for AbortTask {
     }
 }
 
-struct V4Inner {
-    credential: Arc<V4DeviceCredential>,
+struct V1Inner {
+    credential: Arc<V1DeviceCredential>,
     endpoint: Endpoint,
-    resolver: Arc<dyn V4DeviceResolver>,
-    config: V4ClientConfig,
+    resolver: Arc<dyn V1DeviceResolver>,
+    config: V1ClientConfig,
     pending: Arc<PendingQueue>,
-    active_records: Arc<Mutex<HashMap<String, V4DeviceRecord>>>,
+    active_records: Arc<Mutex<HashMap<String, V1DeviceRecord>>>,
     instance_nonce: String,
     _accept_task: AbortTask,
 }
 
-/// Pubky-discovered iroh v4 endpoint for native or relay-only browser peers.
+/// Pubky-discovered iroh v1 endpoint for native or relay-only browser peers.
 ///
 /// Every returned [`Peer`] uses one bounded stream over authenticated TLS 1.3 QUIC with the exact
-/// v4 ALPN. Inbound Hello verification is fully offline before consent. After consent, both peers
+/// v1 ALPN. Inbound Hello verification is fully offline before consent. After consent, both peers
 /// must prove live identity-level homeserver write authority using the Ack's fresh challenge. The
 /// proof does not claim the embedded Grant itself was checked for revocation by the homeserver.
 #[derive(Clone)]
-pub struct V4Client {
-    inner: Arc<V4Inner>,
+pub struct V1Client {
+    inner: Arc<V1Inner>,
 }
 
-struct PendingV4 {
+struct PendingV1 {
     connection: Connection,
     send: SendStream,
     recv: RecvStream,
-    local: Arc<V4DeviceCredential>,
-    resolver: Arc<dyn V4DeviceResolver>,
-    sender: ResolvedV4Device,
-    target: ResolvedV4Device,
-    hello: V4SignedHello,
+    local: Arc<V1DeviceCredential>,
+    resolver: Arc<dyn V1DeviceResolver>,
+    sender: ResolvedV1Device,
+    target: ResolvedV1Device,
+    hello: V1SignedHello,
     max_message_bytes: usize,
     allow_insecure_loopback_relay: bool,
     deadline: Instant,
@@ -355,17 +355,17 @@ struct PendingV4 {
     _capacity_permit: OwnedSemaphorePermit,
 }
 
-/// An offline-authenticated v4 Hello awaiting explicit application consent.
+/// An offline-authenticated v1 Hello awaiting explicit application consent.
 ///
 /// No Pubky resolver, PKARR, DNS, redirect, HTTP, or other sender-chosen network operation has
 /// occurred. Rejecting, dropping, or allowing the deadline to expire closes the QUIC connection.
-pub struct IncomingV4 {
-    pending: Option<PendingV4>,
+pub struct IncomingV1 {
+    pending: Option<PendingV1>,
 }
 
-impl std::fmt::Debug for IncomingV4 {
+impl std::fmt::Debug for IncomingV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut value = formatter.debug_struct("IncomingV4");
+        let mut value = formatter.debug_struct("IncomingV1");
         if let Some(pending) = &self.pending {
             value
                 .field("identity", &pending.hello.claims.from_identity)
@@ -376,7 +376,7 @@ impl std::fmt::Debug for IncomingV4 {
     }
 }
 
-impl IncomingV4 {
+impl IncomingV1 {
     /// Root-authorized caller Pubky identity verified entirely offline.
     #[must_use]
     pub fn identity(&self) -> &str {
@@ -416,7 +416,7 @@ impl IncomingV4 {
         let connection = pending.connection.clone();
         let result = accept_pending(pending).await;
         if result.is_err() {
-            connection.close(1u32.into(), b"v4 accepted handshake failed");
+            connection.close(1u32.into(), b"v1 accepted handshake failed");
         }
         result
     }
@@ -426,17 +426,17 @@ impl IncomingV4 {
         if let Some(pending) = self.pending.take() {
             pending
                 .connection
-                .close(1u32.into(), b"application rejected v4 Hello");
+                .close(1u32.into(), b"application rejected v1 Hello");
         }
     }
 }
 
-impl Drop for IncomingV4 {
+impl Drop for IncomingV1 {
     fn drop(&mut self) {
         if let Some(pending) = self.pending.take() {
             pending
                 .connection
-                .close(1u32.into(), b"application dropped v4 Hello");
+                .close(1u32.into(), b"application dropped v1 Hello");
         }
     }
 }
@@ -445,23 +445,23 @@ impl Drop for IncomingV4 {
     clippy::too_many_lines,
     reason = "the proof exchange deliberately keeps its confirmation barrier in one transaction"
 )]
-async fn accept_pending(mut pending: PendingV4) -> Result<Peer> {
+async fn accept_pending(mut pending: PendingV1) -> Result<Peer> {
     pending.expiry_cancel.take();
     let Some(remaining) = pending.deadline.checked_duration_since(Instant::now()) else {
-        return Err(ClientError::Timeout("accepting inbound v4 peer"));
+        return Err(ClientError::Timeout("accepting inbound v1 peer"));
     };
     let now = now_seconds();
     let expires_at = pending
         .hello
         .claims
         .expires_at
-        .min(now.saturating_add(V4_MAX_CURRENTNESS_LIFETIME_SECONDS));
+        .min(now.saturating_add(V1_MAX_CURRENTNESS_LIFETIME_SECONDS));
     if expires_at <= now {
-        return Err(ClientError::Timeout("accepting inbound v4 peer"));
+        return Err(ClientError::Timeout("accepting inbound v1 peer"));
     }
-    let challenge = v4_random_challenge();
+    let challenge = v1_random_challenge();
     let ack = if pending.allow_insecure_loopback_relay {
-        V4SignedAck::sign_for_local_development(
+        V1SignedAck::sign_for_local_development(
             &pending.local,
             &pending.hello,
             &pending.sender.record,
@@ -471,7 +471,7 @@ async fn accept_pending(mut pending: PendingV4) -> Result<Peer> {
             expires_at,
         )?
     } else {
-        V4SignedAck::sign(
+        V1SignedAck::sign(
             &pending.local,
             &pending.hello,
             &pending.sender.record,
@@ -481,12 +481,12 @@ async fn accept_pending(mut pending: PendingV4) -> Result<Peer> {
             expires_at,
         )?
     };
-    let proof = V4SignedCurrentnessProof::sign(
+    let proof = V1SignedCurrentnessProof::sign(
         &pending.local,
         &pending.target.record,
         &pending.sender.record,
         &pending.hello,
-        V4CurrentnessRole::Responder,
+        V1CurrentnessRole::Responder,
         challenge.clone(),
         now,
         expires_at,
@@ -494,7 +494,7 @@ async fn accept_pending(mut pending: PendingV4) -> Result<Peer> {
     )?;
     pending.resolver.publish_currentness_proof(&proof).await?;
     let operation = async {
-        write_json(&mut pending.send, &ack, V4_MAX_ACK_BYTES).await?;
+        write_json(&mut pending.send, &ack, V1_MAX_ACK_BYTES).await?;
         let ready: ProofReady = read_json(&mut pending.recv, MAX_PROOF_CONTROL_BYTES).await?;
         validate_proof_control(
             ready.version,
@@ -517,7 +517,7 @@ async fn accept_pending(mut pending: PendingV4) -> Result<Peer> {
             &pending.sender.record,
             &pending.target.record,
             &pending.hello,
-            V4CurrentnessRole::Initiator,
+            V1CurrentnessRole::Initiator,
             &challenge,
             now_seconds(),
             pending.allow_insecure_loopback_relay,
@@ -527,7 +527,7 @@ async fn accept_pending(mut pending: PendingV4) -> Result<Peer> {
             .commit_remote_record(&pending.sender)
             .await?;
         let confirmed = ProofConfirmed {
-            version: V4_PROTOCOL_VERSION,
+            version: V1_PROTOCOL_VERSION,
             challenge: challenge.clone(),
             initiator_proof_path: ready.initiator_proof_path,
             responder_proof_path: ready.responder_proof_path,
@@ -537,7 +537,7 @@ async fn accept_pending(mut pending: PendingV4) -> Result<Peer> {
     };
     let exchange = time::timeout(remaining, operation)
         .await
-        .map_err(|_| ClientError::Timeout("completing accepted v4 currentness exchange"))?;
+        .map_err(|_| ClientError::Timeout("completing accepted v1 currentness exchange"))?;
     let _ = pending.resolver.delete_currentness_proof(&proof).await;
     exchange?;
 
@@ -555,7 +555,7 @@ async fn accept_pending(mut pending: PendingV4) -> Result<Peer> {
 
 struct PendingQueueState {
     order: VecDeque<String>,
-    entries: HashMap<String, IncomingV4>,
+    entries: HashMap<String, IncomingV1>,
     per_identity: HashMap<String, usize>,
     closed: bool,
 }
@@ -582,7 +582,7 @@ impl PendingQueue {
         }
     }
 
-    async fn insert(&self, key: String, incoming: IncomingV4) -> Result<()> {
+    async fn insert(&self, key: String, incoming: IncomingV1) -> Result<()> {
         let mut state = self.state.lock().await;
         Self::prune_expired(&mut state, Instant::now());
         if state.closed {
@@ -590,14 +590,14 @@ impl PendingQueue {
         }
         if state.entries.len() >= self.capacity || state.entries.contains_key(&key) {
             return Err(ClientError::Iroh(
-                "authenticated v4 peer queue is full".to_owned(),
+                "authenticated v1 peer queue is full".to_owned(),
             ));
         }
         let identity = incoming.identity().to_owned();
         let count = state.per_identity.get(&identity).copied().unwrap_or(0);
         if count >= self.per_identity_capacity {
             return Err(ClientError::Iroh(
-                "authenticated v4 identity pending limit reached".to_owned(),
+                "authenticated v1 identity pending limit reached".to_owned(),
             ));
         }
         state.per_identity.insert(identity, count + 1);
@@ -615,7 +615,7 @@ impl PendingQueue {
         self.notify.notify_waiters();
     }
 
-    async fn next(&self) -> Result<IncomingV4> {
+    async fn next(&self) -> Result<IncomingV1> {
         loop {
             let notified = self.notify.notified();
             {
@@ -661,7 +661,7 @@ impl PendingQueue {
         }
     }
 
-    fn remove(state: &mut PendingQueueState, key: &str) -> Option<IncomingV4> {
+    fn remove(state: &mut PendingQueueState, key: &str) -> Option<IncomingV1> {
         let incoming = state.entries.remove(key)?;
         state.order.retain(|queued| queued != key);
         let identity = incoming.identity().to_owned();
@@ -675,10 +675,10 @@ impl PendingQueue {
     }
 }
 
-impl std::fmt::Debug for V4Client {
+impl std::fmt::Debug for V1Client {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("V4Client")
+            .debug_struct("V1Client")
             .field("identity", &self.identity())
             .field("device_id", &self.device_id())
             .field("iroh_endpoint_id", &self.iroh_endpoint_id())
@@ -686,8 +686,8 @@ impl std::fmt::Debug for V4Client {
     }
 }
 
-impl V4Client {
-    /// Bind a v4 iroh endpoint and start its bounded offline-authentication accept loop.
+impl V1Client {
+    /// Bind a v1 iroh endpoint and start its bounded offline-authentication accept loop.
     ///
     /// # Errors
     ///
@@ -698,9 +698,9 @@ impl V4Client {
         reason = "endpoint policy and bounded accept-task setup are one security transaction"
     )]
     pub async fn bind(
-        credential: V4DeviceCredential,
-        resolver: Arc<dyn V4DeviceResolver>,
-        config: V4ClientConfig,
+        credential: V1DeviceCredential,
+        resolver: Arc<dyn V1DeviceResolver>,
+        config: V1ClientConfig,
     ) -> Result<Self> {
         config.validate()?;
         credential.verify(now_seconds())?;
@@ -729,7 +729,7 @@ impl V4Client {
             .build();
         let builder = Endpoint::builder(presets::Minimal)
             .secret_key(secret)
-            .alpns(vec![V4_IROH_ALPN.to_vec()])
+            .alpns(vec![V1_IROH_ALPN.to_vec()])
             .max_tls_tickets(0)
             .transport_config(transport)
             .relay_mode(RelayMode::Custom(
@@ -765,7 +765,7 @@ impl V4Client {
         {
             endpoint.close().await;
             return Err(ClientError::Timeout(
-                "registering v4 endpoint with iroh relay",
+                "registering v1 endpoint with iroh relay",
             ));
         }
 
@@ -800,27 +800,27 @@ impl V4Client {
                 let config = task_config.clone();
                 let deadline = Instant::now() + config.pre_hello_timeout;
                 drop(spawn(async move {
-                    if let Err(error) = handle_incoming_v4(
+                    if let Err(error) = handle_incoming_v1(
                         incoming, credential, resolver, records, replay, pending, config, deadline,
                         permit,
                     )
                     .await
                     {
-                        debug!(%error, "discarded unauthenticated v4 iroh connection");
+                        debug!(%error, "discarded unauthenticated v1 iroh connection");
                     }
                 }));
             }
         });
 
         Ok(Self {
-            inner: Arc::new(V4Inner {
+            inner: Arc::new(V1Inner {
                 credential,
                 endpoint,
                 resolver,
                 config,
                 pending,
                 active_records,
-                instance_nonce: v4_random_challenge(),
+                instance_nonce: v1_random_challenge(),
                 _accept_task: AbortTask(task),
             }),
         })
@@ -846,7 +846,7 @@ impl V4Client {
 
     /// Grant-`cnf`-signed local device certificate.
     #[must_use]
-    pub fn credential(&self) -> &V4DeviceCredential {
+    pub fn credential(&self) -> &V1DeviceCredential {
         &self.inner.credential
     }
 
@@ -862,17 +862,17 @@ impl V4Client {
         &self,
         sequence: u64,
         lifetime: Duration,
-    ) -> Result<V4DeviceRecord> {
+    ) -> Result<V1DeviceRecord> {
         let lifetime_seconds = lifetime.as_secs();
-        if lifetime_seconds == 0 || lifetime_seconds > V4_MAX_LOCATOR_LIFETIME_SECONDS {
+        if lifetime_seconds == 0 || lifetime_seconds > V1_MAX_LOCATOR_LIFETIME_SECONDS {
             return Err(ClientError::Iroh(
-                "v4 locator lifetime is outside protocol bounds".to_owned(),
+                "v1 locator lifetime is outside protocol bounds".to_owned(),
             ));
         }
         let now = now_seconds();
         let expires_at = now
             .checked_add(lifetime_seconds)
-            .ok_or_else(|| ClientError::Iroh("v4 locator expiry overflow".to_owned()))?;
+            .ok_or_else(|| ClientError::Iroh("v1 locator expiry overflow".to_owned()))?;
         let relay_urls = self
             .inner
             .config
@@ -881,7 +881,7 @@ impl V4Client {
             .map(|relay| relay.url.clone())
             .collect();
         let locator = if self.inner.config.allow_insecure_loopback_relay {
-            V4SignedLocator::sign_for_local_development(
+            V1SignedLocator::sign_for_local_development(
                 &self.inner.credential,
                 relay_urls,
                 self.inner.instance_nonce.clone(),
@@ -890,7 +890,7 @@ impl V4Client {
                 expires_at,
             )?
         } else {
-            V4SignedLocator::sign(
+            V1SignedLocator::sign(
                 &self.inner.credential,
                 relay_urls,
                 self.inner.instance_nonce.clone(),
@@ -899,7 +899,7 @@ impl V4Client {
                 expires_at,
             )?
         };
-        let record = V4DeviceRecord::new(
+        let record = V1DeviceRecord::new(
             &self.inner.credential,
             locator,
             now,
@@ -930,7 +930,7 @@ impl V4Client {
         &self,
         sequences: &dyn PublisherSequenceStore,
         lifetime: Duration,
-    ) -> Result<V4DeviceRecord> {
+    ) -> Result<V1DeviceRecord> {
         let sequence = sequences
             .next_locator_sequence(self.identity(), self.inner.credential.control_signing_key())
             .await?;
@@ -959,7 +959,7 @@ impl V4Client {
             self.dial_inner(target_identity, target_device_id, application),
         )
         .await
-        .map_err(|_| ClientError::Timeout("resolving and connecting to v4 peer"))?
+        .map_err(|_| ClientError::Timeout("resolving and connecting to v1 peer"))?
     }
 
     async fn dial_inner(
@@ -993,7 +993,7 @@ impl V4Client {
             .collect();
         if candidates.is_empty() {
             return Err(ClientError::Discovery(
-                "requested v4 device is not currently published".to_owned(),
+                "requested v1 device is not currently published".to_owned(),
             ));
         }
         let mut failures = 0usize;
@@ -1004,11 +1004,11 @@ impl V4Client {
             }
         }
         Err(ClientError::Iroh(format!(
-            "all {failures} bounded v4 device attempts failed"
+            "all {failures} bounded v1 device attempts failed"
         )))
     }
 
-    async fn dial_device(&self, target: ResolvedV4Device, application: &str) -> Result<Peer> {
+    async fn dial_device(&self, target: ResolvedV1Device, application: &str) -> Result<Peer> {
         let identity = &target.record.certificate.claims.identity;
         target.record.verify(
             identity,
@@ -1036,16 +1036,16 @@ impl V4Client {
         );
         let connection = time::timeout(
             self.inner.config.peer_handshake_timeout,
-            self.inner.endpoint.connect(address, V4_IROH_ALPN),
+            self.inner.endpoint.connect(address, V1_IROH_ALPN),
         )
         .await
-        .map_err(|_| ClientError::Timeout("connecting v4 iroh QUIC peer"))?
+        .map_err(|_| ClientError::Timeout("connecting v1 iroh QUIC peer"))?
         .map_err(|error| ClientError::Iroh(error.to_string()))?;
         let result = self
             .finish_outbound_handshake(connection.clone(), expected_id, &target, application)
             .await;
         if result.is_err() {
-            connection.close(1u32.into(), b"invalid v4 handshake");
+            connection.close(1u32.into(), b"invalid v1 handshake");
         }
         result
     }
@@ -1054,7 +1054,7 @@ impl V4Client {
         &self,
         connection: Connection,
         expected_id: EndpointId,
-        target: &ResolvedV4Device,
+        target: &ResolvedV1Device,
         application: &str,
     ) -> Result<Peer> {
         if connection.remote_id() != expected_id {
@@ -1065,7 +1065,7 @@ impl V4Client {
             connection.open_bi(),
         )
         .await
-        .map_err(|_| ClientError::Timeout("opening v4 authenticated QUIC stream"))?
+        .map_err(|_| ClientError::Timeout("opening v1 authenticated QUIC stream"))?
         .map_err(|error| ClientError::Iroh(error.to_string()))?;
         let now = now_seconds();
         let sender_record = {
@@ -1084,34 +1084,34 @@ impl V4Client {
         }
         .ok_or_else(|| {
             ClientError::State(
-                "a current local v4 record must be registered before dialing".to_owned(),
+                "a current local v1 record must be registered before dialing".to_owned(),
             )
         })?;
         let expiry = now
-            .saturating_add(V4_MAX_HANDSHAKE_LIFETIME_SECONDS.min(30))
+            .saturating_add(V1_MAX_HANDSHAKE_LIFETIME_SECONDS.min(30))
             .min(sender_record.locator.claims.expires_at)
             .min(target.record.locator.claims.expires_at)
             .min(sender_record.certificate.claims.expires_at)
             .min(target.record.certificate.claims.expires_at);
         if expiry <= now {
-            return Err(ClientError::Timeout("creating v4 Hello"));
+            return Err(ClientError::Timeout("creating v1 Hello"));
         }
         let hello = if self.inner.config.allow_insecure_loopback_relay {
-            V4SignedHello::sign_for_local_development(
+            V1SignedHello::sign_for_local_development(
                 &self.inner.credential,
                 &sender_record,
                 &target.record,
                 application,
-                v4_random_challenge(),
+                v1_random_challenge(),
                 (now, expiry),
             )?
         } else {
-            V4SignedHello::sign(
+            V1SignedHello::sign(
                 &self.inner.credential,
                 &sender_record,
                 &target.record,
                 application,
-                v4_random_challenge(),
+                v1_random_challenge(),
                 (now, expiry),
             )?
         };
@@ -1125,7 +1125,7 @@ impl V4Client {
         );
         time::timeout(self.inner.config.peer_handshake_timeout, handshake)
             .await
-            .map_err(|_| ClientError::Timeout("exchanging v4 Hello and currentness proofs"))??;
+            .map_err(|_| ClientError::Timeout("exchanging v1 Hello and currentness proofs"))??;
         let session_id = nonce_uuid(&hello.claims.session_nonce)?;
         Ok(Peer::new(
             connection,
@@ -1142,13 +1142,13 @@ impl V4Client {
         &self,
         send: &mut SendStream,
         recv: &mut RecvStream,
-        hello: &V4SignedHello,
-        sender_record: &V4DeviceRecord,
-        target: &ResolvedV4Device,
+        hello: &V1SignedHello,
+        sender_record: &V1DeviceRecord,
+        target: &ResolvedV1Device,
         application: &str,
     ) -> Result<()> {
-        write_json(send, hello, V4_MAX_HELLO_BYTES).await?;
-        let ack: V4SignedAck = read_json(recv, V4_MAX_ACK_BYTES).await?;
+        write_json(send, hello, V1_MAX_HELLO_BYTES).await?;
+        let ack: V1SignedAck = read_json(recv, V1_MAX_ACK_BYTES).await?;
         ack.verify(
             &target.record,
             sender_record,
@@ -1158,12 +1158,12 @@ impl V4Client {
             self.inner.config.allow_insecure_loopback_relay,
         )?;
         let challenge = ack.claims.responder_nonce.clone();
-        let proof = V4SignedCurrentnessProof::sign(
+        let proof = V1SignedCurrentnessProof::sign(
             &self.inner.credential,
             sender_record,
             &target.record,
             hello,
-            V4CurrentnessRole::Initiator,
+            V1CurrentnessRole::Initiator,
             challenge.clone(),
             ack.claims.issued_at,
             ack.claims.expires_at,
@@ -1176,7 +1176,7 @@ impl V4Client {
         let operation = async {
             let initiator_path = proof.path()?;
             let responder_path = currentness_path(
-                V4CurrentnessRole::Responder,
+                V1CurrentnessRole::Responder,
                 &challenge,
                 hello,
                 &target.record,
@@ -1193,20 +1193,20 @@ impl V4Client {
                 &target.record,
                 sender_record,
                 hello,
-                V4CurrentnessRole::Responder,
+                V1CurrentnessRole::Responder,
                 &challenge,
                 now_seconds(),
                 self.inner.config.allow_insecure_loopback_relay,
             )?;
             let ready = ProofReady {
-                version: V4_PROTOCOL_VERSION,
+                version: V1_PROTOCOL_VERSION,
                 challenge: challenge.clone(),
                 initiator_proof_path: initiator_path.clone(),
                 responder_proof_path: responder_path.clone(),
             };
             write_json(send, &ready, MAX_PROOF_CONTROL_BYTES).await?;
             let confirmed: ProofConfirmed = read_json(recv, MAX_PROOF_CONTROL_BYTES).await?;
-            if confirmed.version != V4_PROTOCOL_VERSION
+            if confirmed.version != V1_PROTOCOL_VERSION
                 || confirmed.challenge != challenge
                 || confirmed.initiator_proof_path != initiator_path
                 || confirmed.responder_proof_path != responder_path
@@ -1226,7 +1226,7 @@ impl V4Client {
     /// # Errors
     ///
     /// Returns an error after this endpoint is closed.
-    pub async fn next_incoming(&self) -> Result<IncomingV4> {
+    pub async fn next_incoming(&self) -> Result<IncomingV1> {
         self.inner.pending.next().await
     }
 
@@ -1235,7 +1235,7 @@ impl V4Client {
     /// # Errors
     ///
     /// Returns an error after this endpoint is closed.
-    pub async fn accept(&self) -> Result<IncomingV4> {
+    pub async fn accept(&self) -> Result<IncomingV1> {
         self.next_incoming().await
     }
 
@@ -1275,7 +1275,7 @@ impl ReplayCache {
         }
         if self.entries.len() >= self.capacity {
             return Err(ClientError::Iroh(
-                "v4 replay cache reached its authenticated-entry limit".to_owned(),
+                "v1 replay cache reached its authenticated-entry limit".to_owned(),
             ));
         }
         if self
@@ -1286,7 +1286,7 @@ impl ReplayCache {
             >= self.per_identity_capacity
         {
             return Err(ClientError::Iroh(
-                "v4 replay cache reached its per-identity limit".to_owned(),
+                "v1 replay cache reached its per-identity limit".to_owned(),
             ));
         }
         self.entries.insert(
@@ -1305,22 +1305,22 @@ impl ReplayCache {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_incoming_v4(
+async fn handle_incoming_v1(
     incoming: iroh::endpoint::Incoming,
-    local: Arc<V4DeviceCredential>,
-    resolver: Arc<dyn V4DeviceResolver>,
-    active_records: Arc<Mutex<HashMap<String, V4DeviceRecord>>>,
+    local: Arc<V1DeviceCredential>,
+    resolver: Arc<dyn V1DeviceResolver>,
+    active_records: Arc<Mutex<HashMap<String, V1DeviceRecord>>>,
     replay: Arc<Mutex<ReplayCache>>,
     pending_queue: Arc<PendingQueue>,
-    config: V4ClientConfig,
+    config: V1ClientConfig,
     pre_hello_deadline: Instant,
     capacity_permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     let connection = timeout_at(pre_hello_deadline, async move { incoming.await })
         .await
-        .map_err(|_| ClientError::Timeout("pre-authenticating inbound v4 QUIC"))?
+        .map_err(|_| ClientError::Timeout("pre-authenticating inbound v1 QUIC"))?
         .map_err(|error| ClientError::Iroh(error.to_string()))?;
-    let result = authenticate_incoming_v4(
+    let result = authenticate_incoming_v1(
         connection.clone(),
         local,
         resolver,
@@ -1333,20 +1333,20 @@ async fn handle_incoming_v4(
     )
     .await;
     if result.is_err() {
-        connection.close(1u32.into(), b"invalid v4 handshake");
+        connection.close(1u32.into(), b"invalid v1 handshake");
     }
     result
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn authenticate_incoming_v4(
+async fn authenticate_incoming_v1(
     connection: Connection,
-    local: Arc<V4DeviceCredential>,
-    resolver: Arc<dyn V4DeviceResolver>,
-    active_records: Arc<Mutex<HashMap<String, V4DeviceRecord>>>,
+    local: Arc<V1DeviceCredential>,
+    resolver: Arc<dyn V1DeviceResolver>,
+    active_records: Arc<Mutex<HashMap<String, V1DeviceRecord>>>,
     replay: Arc<Mutex<ReplayCache>>,
     pending_queue: Arc<PendingQueue>,
-    config: &V4ClientConfig,
+    config: &V1ClientConfig,
     pre_hello_deadline: Instant,
     capacity_permit: OwnedSemaphorePermit,
 ) -> Result<()> {
@@ -1400,18 +1400,18 @@ async fn authenticate_incoming_v4(
         let admission = pending_queue
             .insert(
                 replay_key.clone(),
-                IncomingV4 {
-                    pending: Some(PendingV4 {
+                IncomingV1 {
+                    pending: Some(PendingV1 {
                         connection,
                         send,
                         recv,
                         local,
                         resolver,
-                        sender: ResolvedV4Device {
+                        sender: ResolvedV1Device {
                             path: sender_record.path()?,
                             record: sender_record,
                         },
-                        target: ResolvedV4Device {
+                        target: ResolvedV1Device {
                             path: target.path()?,
                             record: target,
                         },
@@ -1442,13 +1442,13 @@ async fn authenticate_incoming_v4(
     // remotely supplied identity before application consent.
     time::timeout(config.peer_handshake_timeout, operation)
         .await
-        .map_err(|_| ClientError::Timeout("authenticating signed inbound v4 Hello"))?
+        .map_err(|_| ClientError::Timeout("authenticating signed inbound v1 Hello"))?
 }
 
 async fn receive_initial_hello(
     connection: &Connection,
     deadline: Instant,
-) -> Result<(SendStream, RecvStream, V4SignedHello)> {
+) -> Result<(SendStream, RecvStream, V1SignedHello)> {
     timeout_at(deadline, async {
         let (send, mut recv) = connection
             .accept_bi()
@@ -1457,14 +1457,14 @@ async fn receive_initial_hello(
         if recv.is_0rtt() {
             return Err(ClientError::UnexpectedPeer);
         }
-        let hello = read_json(&mut recv, V4_MAX_HELLO_BYTES).await?;
+        let hello = read_json(&mut recv, V1_MAX_HELLO_BYTES).await?;
         Ok((send, recv, hello))
     })
     .await
-    .map_err(|_| ClientError::Timeout("receiving initial v4 Hello"))?
+    .map_err(|_| ClientError::Timeout("receiving initial v1 Hello"))?
 }
 
-async fn reserve_replay(replay: &Arc<Mutex<ReplayCache>>, hello: &V4SignedHello) -> Result<String> {
+async fn reserve_replay(replay: &Arc<Mutex<ReplayCache>>, hello: &V1SignedHello) -> Result<String> {
     let key = format!(
         "{}:{}",
         hello.claims.from_control_signing_key, hello.claims.session_nonce
@@ -1481,7 +1481,7 @@ async fn reserve_replay(replay: &Arc<Mutex<ReplayCache>>, hello: &V4SignedHello)
 fn pending_deadline(expires_at: u64, limit: Duration, now: u64) -> Result<Instant> {
     let lifetime = limit.min(Duration::from_secs(expires_at.saturating_sub(now)));
     if lifetime.is_zero() {
-        return Err(ClientError::Timeout("queueing inbound v4 consent"));
+        return Err(ClientError::Timeout("queueing inbound v1 consent"));
     }
     Ok(Instant::now() + lifetime)
 }
@@ -1504,7 +1504,7 @@ fn spawn_pending_expiry(
                 if let Some(queue) = weak_queue.upgrade() {
                     queue.expire(&replay_key).await;
                 }
-                connection.close(1u32.into(), b"v4 consent timeout");
+                connection.close(1u32.into(), b"v1 consent timeout");
             }
         }
     }));
@@ -1524,8 +1524,8 @@ where
 }
 
 fn trusted_destination_relays(
-    locator: &V4SignedLocator,
-    config: &V4ClientConfig,
+    locator: &V1SignedLocator,
+    config: &V1ClientConfig,
 ) -> Result<Vec<Url>> {
     let advertised: HashSet<String> = locator
         .claims
@@ -1601,19 +1601,19 @@ fn validate_application(application: &str) -> Result<()> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
     {
         return Err(ClientError::Iroh(
-            "invalid v4 application identifier".to_owned(),
+            "invalid v1 application identifier".to_owned(),
         ));
     }
     Ok(())
 }
 
 fn currentness_path(
-    role: V4CurrentnessRole,
+    role: V1CurrentnessRole,
     challenge: &str,
-    hello: &V4SignedHello,
-    record: &V4DeviceRecord,
+    hello: &V1SignedHello,
+    record: &V1DeviceRecord,
 ) -> Result<String> {
-    Ok(v4_currentness_path(
+    Ok(v1_currentness_path(
         role,
         challenge,
         &hello.digest()?,
@@ -1630,22 +1630,22 @@ fn validate_proof_control(
     expected_challenge: &str,
     initiator_path: &str,
     responder_path: &str,
-    hello: &V4SignedHello,
-    initiator_record: &V4DeviceRecord,
-    responder_record: &V4DeviceRecord,
+    hello: &V1SignedHello,
+    initiator_record: &V1DeviceRecord,
+    responder_record: &V1DeviceRecord,
 ) -> Result<()> {
-    if version != V4_PROTOCOL_VERSION
+    if version != V1_PROTOCOL_VERSION
         || received_challenge != expected_challenge
         || initiator_path
             != currentness_path(
-                V4CurrentnessRole::Initiator,
+                V1CurrentnessRole::Initiator,
                 expected_challenge,
                 hello,
                 initiator_record,
             )?
         || responder_path
             != currentness_path(
-                V4CurrentnessRole::Responder,
+                V1CurrentnessRole::Responder,
                 expected_challenge,
                 hello,
                 responder_record,
@@ -1668,7 +1668,7 @@ async fn write_json<T: Serialize>(stream: &mut SendStream, value: &T, max: usize
     let bytes = serde_json::to_vec(value).map_err(|error| ClientError::Iroh(error.to_string()))?;
     if bytes.len() > max {
         return Err(ClientError::Iroh(
-            "v4 QUIC control message exceeds byte limit".to_owned(),
+            "v1 QUIC control message exceeds byte limit".to_owned(),
         ));
     }
     write_bytes(stream, &bytes).await
@@ -1677,12 +1677,12 @@ async fn write_json<T: Serialize>(stream: &mut SendStream, value: &T, max: usize
 async fn read_json<T: for<'de> Deserialize<'de>>(stream: &mut RecvStream, max: usize) -> Result<T> {
     let bytes = read_bytes(stream, max).await?;
     serde_json::from_slice(&bytes)
-        .map_err(|_| ClientError::Iroh("malformed v4 QUIC control message".to_owned()))
+        .map_err(|_| ClientError::Iroh("malformed v1 QUIC control message".to_owned()))
 }
 
 async fn write_bytes(stream: &mut SendStream, bytes: &[u8]) -> Result<()> {
     let length = u32::try_from(bytes.len())
-        .map_err(|_| ClientError::Iroh("v4 QUIC frame is too large".to_owned()))?;
+        .map_err(|_| ClientError::Iroh("v1 QUIC frame is too large".to_owned()))?;
     stream
         .write_all(&length.to_be_bytes())
         .await
@@ -1702,7 +1702,7 @@ async fn read_bytes(stream: &mut RecvStream, max: usize) -> Result<Vec<u8>> {
     let length = u32::from_be_bytes(length) as usize;
     if length > max {
         return Err(ClientError::Iroh(format!(
-            "v4 peer frame exceeds the {max} byte limit"
+            "v1 peer frame exceeds the {max} byte limit"
         )));
     }
     let mut bytes = vec![0u8; length];
@@ -1725,16 +1725,16 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use hole_punchky_protocol::{V4GrantAuthorization, V4SignedCurrentnessProof};
     use iroh_relay::server::{
         RelayConfig as RelayServerConfig, Server as RelayServer,
         ServerConfig as RelayServerConfigSet,
     };
     use pubky::{Capability, ClientId, GrantClaims, GrantId, Keypair};
+    use pubky2pubky_protocol::{V1GrantAuthorization, V1SignedCurrentnessProof};
     use tokio::sync::Semaphore;
 
     use super::*;
-    use crate::{ConnectionPath, MemorySequenceStore, StaticV4Resolver};
+    use crate::{ConnectionPath, MemorySequenceStore, StaticV1Resolver};
 
     const TEST_APPLICATION: &str = "pubky2pubky/test/echo";
 
@@ -1754,14 +1754,14 @@ mod tests {
 
     #[derive(Clone)]
     struct ControlledResolver {
-        inner: StaticV4Resolver,
+        inner: StaticV1Resolver,
         discard_publications: bool,
         commit_gate: Option<Arc<CommitGate>>,
     }
 
     #[async_trait]
-    impl V4DeviceResolver for ControlledResolver {
-        async fn resolve_devices(&self, identity: &str) -> Result<Vec<ResolvedV4Device>> {
+    impl V1DeviceResolver for ControlledResolver {
+        async fn resolve_devices(&self, identity: &str) -> Result<Vec<ResolvedV1Device>> {
             self.inner.resolve_devices(identity).await
         }
 
@@ -1769,7 +1769,7 @@ mod tests {
             &self,
             identity: &str,
             path: &str,
-        ) -> Result<ResolvedV4Device> {
+        ) -> Result<ResolvedV1Device> {
             self.inner.fetch_device_record(identity, path).await
         }
 
@@ -1777,22 +1777,22 @@ mod tests {
             &self,
             identity: &str,
             path: &str,
-        ) -> Result<V4SignedCurrentnessProof> {
+        ) -> Result<V1SignedCurrentnessProof> {
             self.inner.fetch_currentness_proof(identity, path).await
         }
 
-        async fn publish_currentness_proof(&self, proof: &V4SignedCurrentnessProof) -> Result<()> {
+        async fn publish_currentness_proof(&self, proof: &V1SignedCurrentnessProof) -> Result<()> {
             if self.discard_publications {
                 return Ok(());
             }
             self.inner.publish_currentness_proof(proof).await
         }
 
-        async fn delete_currentness_proof(&self, proof: &V4SignedCurrentnessProof) -> Result<()> {
+        async fn delete_currentness_proof(&self, proof: &V1SignedCurrentnessProof) -> Result<()> {
             self.inner.delete_currentness_proof(proof).await
         }
 
-        async fn commit_remote_record(&self, device: &ResolvedV4Device) -> Result<()> {
+        async fn commit_remote_record(&self, device: &ResolvedV1Device) -> Result<()> {
             if let Some(gate) = &self.commit_gate {
                 gate.entered.store(true, Ordering::SeqCst);
                 gate.release
@@ -1805,7 +1805,7 @@ mod tests {
         }
     }
 
-    fn credential(root: &Keypair, cnf: &Keypair, device_id: &str) -> V4DeviceCredential {
+    fn credential(root: &Keypair, cnf: &Keypair, device_id: &str) -> V1DeviceCredential {
         let now = now_seconds();
         let claims = GrantClaims {
             iss: root.public_key(),
@@ -1822,9 +1822,9 @@ mod tests {
         };
         let identity = root.public_key().z32();
         let authorization =
-            V4GrantAuthorization::from_jws(claims.sign(root, "pubky-grant"), &identity, now)
+            V1GrantAuthorization::from_jws(claims.sign(root, "pubky-grant"), &identity, now)
                 .unwrap_or_else(|error| panic!("grant authorization: {error}"));
-        V4DeviceCredential::issue(authorization, &identity, cnf, device_id, now, now + 1_800)
+        V1DeviceCredential::issue(authorization, &identity, cnf, device_id, now, now + 1_800)
             .unwrap_or_else(|error| panic!("device credential: {error}"))
     }
 
@@ -1842,8 +1842,8 @@ mod tests {
         (server, url)
     }
 
-    fn config(relay_url: Url) -> V4ClientConfig {
-        let mut config = V4ClientConfig::relay_only(
+    fn config(relay_url: Url) -> V1ClientConfig {
+        let mut config = V1ClientConfig::relay_only(
             PublicContactDisclosure::AcknowledgePreConsentRelayMetadataExposure,
             vec![TEST_APPLICATION.to_owned()],
         );
@@ -1858,14 +1858,14 @@ mod tests {
     async fn prepared_clients(
         relay_url: Url,
         discard_alice_publications: bool,
-    ) -> (V4Client, V4Client) {
+    ) -> (V1Client, V1Client) {
         let alice_root = Keypair::random();
         let alice_cnf = Keypair::random();
         let bob_root = Keypair::random();
         let bob_cnf = Keypair::random();
         let alice_credential = credential(&alice_root, &alice_cnf, "alice-device");
         let bob_credential = credential(&bob_root, &bob_cnf, "bob-device");
-        let alice_static = StaticV4Resolver::new(
+        let alice_static = StaticV1Resolver::new(
             alice_credential.identity(),
             Arc::new(MemorySequenceStore::default()),
             true,
@@ -1887,10 +1887,10 @@ mod tests {
             discard_publications: false,
             commit_gate: None,
         });
-        let alice = V4Client::bind(alice_credential, alice_resolver, config(relay_url.clone()))
+        let alice = V1Client::bind(alice_credential, alice_resolver, config(relay_url.clone()))
             .await
             .unwrap_or_else(|error| panic!("binding Alice: {error}"));
-        let bob = V4Client::bind(bob_credential, bob_resolver, config(relay_url))
+        let bob = V1Client::bind(bob_credential, bob_resolver, config(relay_url))
             .await
             .unwrap_or_else(|error| panic!("binding Bob: {error}"));
         for record in [
@@ -1908,6 +1908,28 @@ mod tests {
                 .unwrap_or_else(|error| panic!("publishing record: {error}"));
         }
         (alice, bob)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endpoint_rejects_unpublished_alpn_without_fallback() {
+        let (relay, relay_url) = relay().await;
+        let (alice, bob) = prepared_clients(relay_url, false).await;
+        let attempted = tokio::time::timeout(
+            Duration::from_secs(5),
+            alice
+                .inner
+                .endpoint
+                .connect(bob.inner.endpoint.addr(), b"pubky2pubky/iroh/v4"),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("non-v1 ALPN negotiation did not terminate"));
+        assert!(attempted.is_err(), "a non-v1 ALPN must be rejected");
+        alice.close().await;
+        bob.close().await;
+        relay
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("stopping relay: {error}"));
     }
 
     async fn wait_for_gate(gate: &CommitGate) {
@@ -1935,7 +1957,7 @@ mod tests {
         let bob_cnf = Keypair::random();
         let alice_credential = credential(&alice_root, &alice_cnf, "alice-device");
         let bob_credential = credential(&bob_root, &bob_cnf, "bob-device");
-        let alice_static = StaticV4Resolver::new(
+        let alice_static = StaticV1Resolver::new(
             alice_credential.identity(),
             Arc::new(MemorySequenceStore::default()),
             true,
@@ -1957,10 +1979,10 @@ mod tests {
             discard_publications: false,
             commit_gate: Some(gate.clone()),
         });
-        let alice = V4Client::bind(alice_credential, alice_resolver, config(relay_url.clone()))
+        let alice = V1Client::bind(alice_credential, alice_resolver, config(relay_url.clone()))
             .await
             .unwrap_or_else(|error| panic!("binding Alice: {error}"));
-        let bob = V4Client::bind(bob_credential, bob_resolver.clone(), config(relay_url))
+        let bob = V1Client::bind(bob_credential, bob_resolver.clone(), config(relay_url))
             .await
             .unwrap_or_else(|error| panic!("binding Bob: {error}"));
         for record in [
@@ -1987,8 +2009,8 @@ mod tests {
         });
         let incoming = tokio::time::timeout(Duration::from_secs(5), bob.next_incoming())
             .await
-            .unwrap_or_else(|_| panic!("timed out waiting for v4 Hello"))
-            .unwrap_or_else(|error| panic!("receiving v4 Hello: {error}"));
+            .unwrap_or_else(|_| panic!("timed out waiting for v1 Hello"))
+            .unwrap_or_else(|error| panic!("receiving v1 Hello: {error}"));
         assert_eq!(incoming.identity(), alice.identity());
         assert_eq!(incoming.device_id(), "alice-device");
         assert_eq!(incoming.application(), TEST_APPLICATION);
@@ -2029,7 +2051,7 @@ mod tests {
             ConnectionPath::Relayed
         );
         alice_peer
-            .send(b"v4 encrypted request")
+            .send(b"v1 encrypted request")
             .await
             .unwrap_or_else(|error| panic!("sending request: {error}"));
         assert_eq!(
@@ -2037,7 +2059,7 @@ mod tests {
                 .recv()
                 .await
                 .unwrap_or_else(|error| panic!("receiving request: {error}")),
-            b"v4 encrypted request"
+            b"v1 encrypted request"
         );
 
         alice_peer
@@ -2069,8 +2091,8 @@ mod tests {
         });
         let incoming = tokio::time::timeout(Duration::from_secs(5), bob.next_incoming())
             .await
-            .unwrap_or_else(|_| panic!("timed out waiting for v4 Hello"))
-            .unwrap_or_else(|error| panic!("receiving v4 Hello: {error}"));
+            .unwrap_or_else(|_| panic!("timed out waiting for v1 Hello"))
+            .unwrap_or_else(|error| panic!("receiving v1 Hello: {error}"));
         let accepted = tokio::time::timeout(Duration::from_secs(5), incoming.accept())
             .await
             .unwrap_or_else(|_| panic!("missing proof did not fail responder handshake"));
@@ -2100,19 +2122,19 @@ mod tests {
         let cnf = Keypair::random();
         let credential = credential(&root, &cnf, "device");
         let now = now_seconds();
-        let locator = V4SignedLocator::sign(
+        let locator = V1SignedLocator::sign(
             &credential,
             vec![
                 Url::parse("https://169.254.169.254/")
                     .unwrap_or_else(|error| panic!("attacker URL: {error}")),
             ],
-            v4_random_challenge(),
+            v1_random_challenge(),
             1,
             now,
             now + 60,
         )
         .unwrap_or_else(|error| panic!("signing locator: {error}"));
-        let mut local = V4ClientConfig::relay_only(
+        let mut local = V1ClientConfig::relay_only(
             PublicContactDisclosure::AcknowledgePreConsentRelayMetadataExposure,
             vec![TEST_APPLICATION.to_owned()],
         );
@@ -2162,7 +2184,7 @@ mod tests {
     fn browser_transport_constraints_remain_relay_only_and_secret_free() {
         let relay_url = Url::parse("http://127.0.0.1:3340/")
             .unwrap_or_else(|error| panic!("browser relay URL: {error}"));
-        let mut baseline = V4ClientConfig::relay_only(
+        let mut baseline = V1ClientConfig::relay_only(
             PublicContactDisclosure::AcknowledgePreConsentRelayMetadataExposure,
             vec![TEST_APPLICATION.to_owned()],
         );
@@ -2171,7 +2193,7 @@ mod tests {
         baseline.max_message_bytes = 4_096;
         assert!(baseline.validate_browser_constraints().is_ok());
 
-        let mut direct = V4ClientConfig::direct(
+        let mut direct = V1ClientConfig::direct(
             PublicContactDisclosure::AcknowledgePreConsentNetworkExposure,
             vec![TEST_APPLICATION.to_owned()],
         );
@@ -2198,13 +2220,13 @@ mod tests {
             Url::parse("https://trusted.example/")
                 .unwrap_or_else(|error| panic!("trusted URL: {error}")),
         );
-        let mut mismatched = V4ClientConfig::relay_only(
+        let mut mismatched = V1ClientConfig::relay_only(
             PublicContactDisclosure::AcknowledgePreConsentNetworkExposure,
             vec![TEST_APPLICATION.to_owned()],
         );
         mismatched.trusted_relays = vec![relay.clone()];
         assert!(mismatched.validate().is_err());
-        let mut with_udp = V4ClientConfig::relay_only(
+        let mut with_udp = V1ClientConfig::relay_only(
             PublicContactDisclosure::AcknowledgePreConsentRelayMetadataExposure,
             vec![TEST_APPLICATION.to_owned()],
         );

@@ -3,7 +3,7 @@
 /// Result returned by protocol operations.
 pub type Result<T> = std::result::Result<T, ProtocolError>;
 
-/// An invalid or unauthentic Hole Punchky protocol object.
+/// An invalid or unauthentic pubky2pubky protocol object.
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
     /// JSON could not be encoded or decoded.
@@ -24,9 +24,6 @@ pub enum ProtocolError {
     /// A signed object has expired.
     #[error("object has expired")]
     Expired,
-    /// A delegation lasts longer than policy permits.
-    #[error("device certificate lifetime is too long")]
-    CertificateLifetime,
     /// A required capability was not delegated.
     #[error("device lacks capability {0}")]
     MissingCapability(String),
@@ -39,7 +36,4 @@ pub enum ProtocolError {
     /// The signed message has an invalid time window.
     #[error("invalid message time window")]
     InvalidTimeWindow,
-    /// HPKE encryption or decryption failed.
-    #[error("HPKE operation failed")]
-    Hpke,
 }

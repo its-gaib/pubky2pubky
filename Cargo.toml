@@ -2,9 +2,7 @@
 members = [
     "crates/browser-wasm",
     "crates/client",
-    "crates/cli",
     "crates/protocol",
-    "crates/rendezvous",
 ]
 resolver = "2"
 
@@ -16,33 +14,21 @@ license = "MIT"
 repository = "https://github.com/its-gaib/pubky2pubky"
 
 [workspace.dependencies]
-anyhow = "1.0"
 async-trait = "0.1"
-axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
-clap = { version = "4.5", features = ["derive", "env"] }
 ed25519-dalek = "3.0"
 futures-util = "0.3"
-hpke = { version = "0.14", default-features = false, features = ["alloc", "chacha", "getrandom", "x25519"] }
 iroh = { version = "=1.1.0", default-features = false, features = ["portmapper", "tls-ring"] }
 n0-future = "0.3.2"
-n0-watcher = "1.0"
 pubky = { version = "0.11", features = ["json"] }
 pubky-common = "0.11"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rustls-pki-types = "1.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_jcs = "0.2"
 serde_json = "1.0"
 sha2 = "0.10"
-subtle = "2.6"
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["full"] }
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
-tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["catch-panic", "cors", "limit", "request-id", "trace"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
 web-time = "1.1"

@@ -60,7 +60,7 @@ export type BrowserTransportEvent =
   | { readonly type: "online-state"; readonly online: boolean; readonly status: "online" | "offline" }
   | { readonly type: "inbound-request"; readonly id: string; readonly peerId: PubkyId; readonly peerDeviceId: string; readonly receivedAt: number }
   | { readonly type: "inbound-request-expired"; readonly id: string }
-  | { readonly type: "peer-verified"; readonly peerId: PubkyId; readonly peerDeviceId: string; readonly path: "relay"; readonly route: "relay"; readonly e2e: true; readonly irohQuicEncrypted: true; readonly pubkyIdentityVerified: true; readonly protocolVersion: 4; readonly alpn: "pubky2pubky/iroh/v4" }
+  | { readonly type: "peer-verified"; readonly peerId: PubkyId; readonly peerDeviceId: string; readonly path: "relay"; readonly route: "relay"; readonly e2e: true; readonly irohQuicEncrypted: true; readonly pubkyIdentityVerified: true; readonly protocolVersion: 1; readonly alpn: "pubky2pubky/iroh/v1" }
   | { readonly type: "peer-disconnected"; readonly peerId: PubkyId }
   | { readonly type: "message"; readonly peerId: PubkyId; readonly body: Uint8Array; readonly receivedAt: number }
   | { readonly type: "error"; readonly code: BrowserErrorCode };

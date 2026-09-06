@@ -1,9 +1,9 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use hole_punchky_client::{
-    AuthenticatedSequenceObservation, ClientError, PublisherSequenceStore, SequenceStore,
-};
 use js_sys::{Promise, Reflect, Uint8Array};
 use pubky::{DelegatedSignFn, PublicKey, delegated_sign_callback};
+use pubky2pubky_client::{
+    AuthenticatedSequenceObservation, ClientError, PublisherSequenceStore, SequenceStore,
+};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -51,13 +51,6 @@ extern "C" {
         account: String,
         identity: String,
         control_key: String,
-    ) -> Promise;
-    #[wasm_bindgen(js_name = __p2pRecordLegacySequence)]
-    fn js_record_legacy_sequence(
-        account: String,
-        identity: String,
-        scope: String,
-        counter: f64,
     ) -> Promise;
     #[wasm_bindgen(js_name = __p2pRecordSequenceBatch)]
     fn js_record_sequence_batch(account: String, observations: JsValue) -> Promise;
@@ -265,7 +258,7 @@ impl PublisherSequenceStore for BrowserSequenceStore {
         &self,
         identity: &str,
         control_key: &str,
-    ) -> hole_punchky_client::Result<u64> {
+    ) -> pubky2pubky_client::Result<u64> {
         let value = JsFuture::from(js_next_publisher_sequence(
             self.account.clone(),
             identity.to_owned(),
@@ -288,28 +281,10 @@ struct SequenceObservation<'a> {
 
 #[async_trait::async_trait(?Send)]
 impl SequenceStore for BrowserSequenceStore {
-    async fn record(
-        &self,
-        identity: &str,
-        scope: &str,
-        value: u64,
-    ) -> hole_punchky_client::Result<()> {
-        let counter = counter_to_js(value)?;
-        JsFuture::from(js_record_legacy_sequence(
-            self.account.clone(),
-            identity.to_owned(),
-            scope.to_owned(),
-            counter,
-        ))
-        .await
-        .map_err(sequence_error)?;
-        Ok(())
-    }
-
     async fn record_batch(
         &self,
         observations: Vec<AuthenticatedSequenceObservation>,
-    ) -> hole_punchky_client::Result<()> {
+    ) -> pubky2pubky_client::Result<()> {
         if observations
             .iter()
             .any(|observation| observation.counter() > JS_MAX_SAFE_COUNTER)
@@ -343,7 +318,7 @@ const JS_MAX_SAFE_COUNTER: u64 = 9_007_199_254_740_991;
     clippy::cast_sign_loss,
     reason = "the finite positive integer is bounded to JavaScript's exact u53 range first"
 )]
-fn number_to_counter(value: &JsValue) -> hole_punchky_client::Result<u64> {
+fn number_to_counter(value: &JsValue) -> pubky2pubky_client::Result<u64> {
     let Some(number) = value.as_f64() else {
         return Err(ClientError::State(
             "browser publisher state is invalid".to_owned(),
@@ -355,19 +330,6 @@ fn number_to_counter(value: &JsValue) -> hole_punchky_client::Result<u64> {
         ));
     }
     Ok(number as u64)
-}
-
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "values at or below 2^53-1 are represented exactly by JavaScript Number"
-)]
-fn counter_to_js(value: u64) -> hole_punchky_client::Result<f64> {
-    if value == 0 || value > JS_MAX_SAFE_COUNTER {
-        return Err(ClientError::State(
-            "browser sequence exceeds the exact JavaScript integer range".to_owned(),
-        ));
-    }
-    Ok(value as f64)
 }
 
 fn sequence_error(_value: JsValue) -> ClientError {

@@ -1,8 +1,7 @@
-//! Pubky Grant-authorized iroh discovery and handshake protocol, version 4.
+//! Pubky Grant-authorized iroh discovery and handshake protocol, version 1.
 //!
-//! Version 4 replaces direct root-key device signatures with the standard Pubky 0.11 Grant
-//! chain: the Pubky root signs a Grant JWS, the Grant `cnf` key signs a device certificate, and
-//! the independent device control key signs relay-only locators and handshake records.
+//! The Pubky root signs a standard Pubky 0.11 Grant JWS, the Grant `cnf` key signs a device
+//! certificate, and the independent device control key signs locators and handshake records.
 
 use std::{collections::BTreeSet, fmt};
 
@@ -24,76 +23,76 @@ use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use crate::{
     MAX_CERTIFICATE_LIFETIME_SECONDS, MAX_CLOCK_SKEW_SECONDS, ProtocolError, Result,
-    identity::{canonical_for_signing, encode_signature, parse_public_key},
+    signing::{canonical_for_signing, encode_signature, parse_public_key},
 };
 
 /// Pubky-to-iroh protocol version implemented by this module.
-pub const V4_PROTOCOL_VERSION: u16 = 4;
+pub const V1_PROTOCOL_VERSION: u16 = 1;
 
-/// Public-storage directory containing self-contained v4 device records.
-pub const V4_DEVICE_RECORD_PATH_PREFIX: &str = "/pub/pubky2pubky/v4/devices/";
+/// Public-storage directory containing self-contained v1 device records.
+pub const V1_DEVICE_RECORD_PATH_PREFIX: &str = "/pub/pubky2pubky/v1/devices/";
 
-/// Public-storage directory containing short-lived v4 currentness proofs.
-pub const V4_CURRENTNESS_PATH_PREFIX: &str = "/pub/pubky2pubky/v4/currentness/";
+/// Public-storage directory containing short-lived v1 currentness proofs.
+pub const V1_CURRENTNESS_PATH_PREFIX: &str = "/pub/pubky2pubky/v1/currentness/";
 
-/// Text representation of the fixed v4 QUIC ALPN.
-pub const V4_IROH_ALPN_TEXT: &str = "pubky2pubky/iroh/v4";
+/// Text representation of the fixed v1 QUIC ALPN.
+pub const V1_IROH_ALPN_TEXT: &str = "pubky2pubky/iroh/v1";
 
-/// Fixed v4 QUIC ALPN bytes passed to iroh.
-pub const V4_IROH_ALPN: &[u8] = b"pubky2pubky/iroh/v4";
+/// Fixed v1 QUIC ALPN bytes passed to iroh.
+pub const V1_IROH_ALPN: &[u8] = b"pubky2pubky/iroh/v1";
 
-/// Storage scope every v4 Grant must authorize for writing.
-pub const V4_REQUIRED_STORAGE_SCOPE: &str = "/pub/pubky2pubky/";
+/// Storage scope every v1 Grant must authorize for writing.
+pub const V1_REQUIRED_STORAGE_SCOPE: &str = "/pub/pubky2pubky/";
 
 /// Maximum accepted Pubky Grant JWS size.
-pub const V4_MAX_GRANT_JWS_BYTES: usize = 16 * 1024;
+pub const V1_MAX_GRANT_JWS_BYTES: usize = 16 * 1024;
 
 /// Maximum capabilities accepted in a Pubky Grant.
-pub const V4_MAX_GRANT_CAPABILITIES: usize = 32;
+pub const V1_MAX_GRANT_CAPABILITIES: usize = 32;
 
 /// Maximum accepted Grant lifetime, matching the Pubky 0.11 default horizon.
-pub const V4_MAX_GRANT_LIFETIME_SECONDS: u64 = 2 * 365 * 24 * 60 * 60;
+pub const V1_MAX_GRANT_LIFETIME_SECONDS: u64 = 2 * 365 * 24 * 60 * 60;
 
 /// Maximum lifetime of a Grant-`cnf`-signed device certificate.
-pub const V4_MAX_DEVICE_CERTIFICATE_LIFETIME_SECONDS: u64 = MAX_CERTIFICATE_LIFETIME_SECONDS;
+pub const V1_MAX_DEVICE_CERTIFICATE_LIFETIME_SECONDS: u64 = MAX_CERTIFICATE_LIFETIME_SECONDS;
 
 /// Maximum iroh relay URLs in one locator.
-pub const V4_MAX_RELAY_URLS: usize = 4;
+pub const V1_MAX_RELAY_URLS: usize = 4;
 
 /// Maximum device-signed locator lifetime.
-pub const V4_MAX_LOCATOR_LIFETIME_SECONDS: u64 = 15 * 60;
+pub const V1_MAX_LOCATOR_LIFETIME_SECONDS: u64 = 15 * 60;
 
 /// Maximum Hello or Ack lifetime.
-pub const V4_MAX_HANDSHAKE_LIFETIME_SECONDS: u64 = 2 * 60;
+pub const V1_MAX_HANDSHAKE_LIFETIME_SECONDS: u64 = 2 * 60;
 
 /// Maximum currentness-proof lifetime.
-pub const V4_MAX_CURRENTNESS_LIFETIME_SECONDS: u64 = 30;
+pub const V1_MAX_CURRENTNESS_LIFETIME_SECONDS: u64 = 30;
 
 /// Maximum encoded self-contained device-record size.
-pub const V4_MAX_DEVICE_RECORD_BYTES: usize = 32 * 1024;
+pub const V1_MAX_DEVICE_RECORD_BYTES: usize = 32 * 1024;
 
 /// Maximum encoded Hello size.
-pub const V4_MAX_HELLO_BYTES: usize = 48 * 1024;
+pub const V1_MAX_HELLO_BYTES: usize = 48 * 1024;
 
 /// Maximum encoded Ack size.
-pub const V4_MAX_ACK_BYTES: usize = 8 * 1024;
+pub const V1_MAX_ACK_BYTES: usize = 8 * 1024;
 
 /// Maximum encoded currentness-proof size.
-pub const V4_MAX_CURRENTNESS_PROOF_BYTES: usize = 4 * 1024;
+pub const V1_MAX_CURRENTNESS_PROOF_BYTES: usize = 4 * 1024;
 
-const V4_GRANT_HEADER_JSON: &[u8] = br#"{"alg":"EdDSA","typ":"pubky-grant"}"#;
-const V4_GRANT_DIGEST_DOMAIN: &str = "pubky2pubky/grant-digest/v4";
-const V4_CERTIFICATE_DOMAIN: &str = "pubky2pubky/device-certificate/v4";
-const V4_CERTIFICATE_DIGEST_DOMAIN: &str = "pubky2pubky/device-certificate-digest/v4";
-const V4_DEVICE_RECORD_DIGEST_DOMAIN: &str = "pubky2pubky/device-record-digest/v4";
-const V4_DEVICE_PATH_DOMAIN: &str = "pubky2pubky/device-path/v4";
-const V4_LOCATOR_DOMAIN: &str = "pubky2pubky/iroh-locator/v4";
-const V4_LOCATOR_DIGEST_DOMAIN: &str = "pubky2pubky/iroh-locator-digest/v4";
-const V4_HELLO_DOMAIN: &str = "pubky2pubky/hello/v4";
-const V4_HELLO_DIGEST_DOMAIN: &str = "pubky2pubky/hello-digest/v4";
-const V4_ACK_DOMAIN: &str = "pubky2pubky/ack/v4";
-const V4_CURRENTNESS_DOMAIN: &str = "pubky2pubky/currentness/v4";
-const V4_CURRENTNESS_PATH_DOMAIN: &str = "pubky2pubky/currentness-path/v4";
+const V1_GRANT_HEADER_JSON: &[u8] = br#"{"alg":"EdDSA","typ":"pubky-grant"}"#;
+const V1_GRANT_DIGEST_DOMAIN: &str = "pubky2pubky/grant-digest/v1";
+const V1_CERTIFICATE_DOMAIN: &str = "pubky2pubky/device-certificate/v1";
+const V1_CERTIFICATE_DIGEST_DOMAIN: &str = "pubky2pubky/device-certificate-digest/v1";
+const V1_DEVICE_RECORD_DIGEST_DOMAIN: &str = "pubky2pubky/device-record-digest/v1";
+const V1_DEVICE_PATH_DOMAIN: &str = "pubky2pubky/device-path/v1";
+const V1_LOCATOR_DOMAIN: &str = "pubky2pubky/iroh-locator/v1";
+const V1_LOCATOR_DIGEST_DOMAIN: &str = "pubky2pubky/iroh-locator-digest/v1";
+const V1_HELLO_DOMAIN: &str = "pubky2pubky/hello/v1";
+const V1_HELLO_DIGEST_DOMAIN: &str = "pubky2pubky/hello-digest/v1";
+const V1_ACK_DOMAIN: &str = "pubky2pubky/ack/v1";
+const V1_CURRENTNESS_DOMAIN: &str = "pubky2pubky/currentness/v1";
+const V1_CURRENTNESS_PATH_DOMAIN: &str = "pubky2pubky/currentness-path/v1";
 const MAX_DEVICE_ID_BYTES: usize = 64;
 const MAX_APPLICATION_BYTES: usize = 128;
 const MAX_RELAY_URL_BYTES: usize = 2_048;
@@ -102,14 +101,14 @@ const MAX_CHALLENGE_BYTES: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct V4GrantHeader {
+struct V1GrantHeader {
     alg: String,
     typ: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct V4GrantClaimsWire {
+struct V1GrantClaimsWire {
     iss: PublicKey,
     client_id: ClientId,
     caps: Vec<Capability>,
@@ -119,7 +118,7 @@ struct V4GrantClaimsWire {
     exp: u64,
 }
 
-impl V4GrantClaimsWire {
+impl V1GrantClaimsWire {
     fn into_claims(self) -> GrantClaims {
         GrantClaims {
             iss: self.iss,
@@ -143,9 +142,9 @@ fn decode_canonical_base64(value: &str, label: &'static str) -> Result<Vec<u8>> 
     Ok(bytes)
 }
 
-fn decode_v4_signature(encoded: &str) -> Result<Signature> {
-    let bytes = decode_canonical_base64(encoded, "canonical v4 signature")?;
-    Signature::from_slice(&bytes).map_err(|_| ProtocolError::InvalidEncoding("v4 signature"))
+fn decode_v1_signature(encoded: &str) -> Result<Signature> {
+    let bytes = decode_canonical_base64(encoded, "canonical v1 signature")?;
+    Signature::from_slice(&bytes).map_err(|_| ProtocolError::InvalidEncoding("v1 signature"))
 }
 
 fn verify_signature(
@@ -154,7 +153,7 @@ fn verify_signature(
     claims: &impl Serialize,
     value: &str,
 ) -> Result<()> {
-    let signature = decode_v4_signature(value)?;
+    let signature = decode_v1_signature(value)?;
     key.verify(&canonical_for_signing(domain, claims)?, &signature)
         .map_err(|_| ProtocolError::BadSignature)
 }
@@ -172,7 +171,7 @@ fn validate_bounded_window(
     if issued_at > now.saturating_add(MAX_CLOCK_SKEW_SECONDS) {
         return Err(ProtocolError::NotYetValid);
     }
-    // Expiry is intentionally strict in v4. In particular, a 30-second currentness proof must
+    // Expiry is intentionally strict in v1. In particular, a 30-second currentness proof must
     // not remain acceptable for an additional global clock-skew window.
     if expires_at <= now {
         return Err(ProtocolError::Expired);
@@ -188,8 +187,8 @@ fn validate_currentness_window(issued_at: u64, expires_at: u64, now: u64) -> Res
         issued_at,
         expires_at,
         now,
-        V4_MAX_CURRENTNESS_LIFETIME_SECONDS,
-        "v4 currentness lifetime",
+        V1_MAX_CURRENTNESS_LIFETIME_SECONDS,
+        "v1 currentness lifetime",
     )?;
     // Currentness is a live-authority check, not a general signed credential. Letting it inherit
     // the protocol-wide clock-skew allowance would make a future-dated 30-second proof usable for
@@ -199,7 +198,7 @@ fn validate_currentness_window(issued_at: u64, expires_at: u64, now: u64) -> Res
     if issued_at > now {
         return Err(ProtocolError::NotYetValid);
     }
-    if expires_at > now.saturating_add(V4_MAX_CURRENTNESS_LIFETIME_SECONDS) {
+    if expires_at > now.saturating_add(V1_MAX_CURRENTNESS_LIFETIME_SECONDS) {
         return Err(ProtocolError::InvalidTimeWindow);
     }
     Ok(())
@@ -243,7 +242,7 @@ fn validate_device_id(device_id: &str) -> Result<()> {
         || device_id.chars().any(char::is_control)
         || device_id.chars().all(char::is_whitespace)
     {
-        return Err(ProtocolError::InvalidEncoding("v4 device id"));
+        return Err(ProtocolError::InvalidEncoding("v1 device id"));
     }
     Ok(())
 }
@@ -255,7 +254,7 @@ fn validate_application(application: &str) -> Result<()> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
     {
-        return Err(ProtocolError::InvalidEncoding("v4 application"));
+        return Err(ProtocolError::InvalidEncoding("v1 application"));
     }
     Ok(())
 }
@@ -281,27 +280,27 @@ fn validate_relay_url(url: &Url, allow_loopback_dev: bool) -> Result<()> {
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err(ProtocolError::InvalidEncoding("v4 relay URL"));
+        return Err(ProtocolError::InvalidEncoding("v1 relay URL"));
     }
     Ok(())
 }
 
 fn validate_relays(relays: &[Url], allow_loopback_dev: bool) -> Result<()> {
-    if relays.is_empty() || relays.len() > V4_MAX_RELAY_URLS {
-        return Err(ProtocolError::InvalidEncoding("v4 relay URLs"));
+    if relays.is_empty() || relays.len() > V1_MAX_RELAY_URLS {
+        return Err(ProtocolError::InvalidEncoding("v1 relay URLs"));
     }
     let mut unique = BTreeSet::new();
     for relay in relays {
         validate_relay_url(relay, allow_loopback_dev)?;
         if !unique.insert(relay.as_str()) {
-            return Err(ProtocolError::InvalidEncoding("duplicate v4 relay URL"));
+            return Err(ProtocolError::InvalidEncoding("duplicate v1 relay URL"));
         }
     }
     Ok(())
 }
 
 fn grant_covers_storage(claims: &GrantClaims) -> bool {
-    let Ok(required) = StoragePath::new(V4_REQUIRED_STORAGE_SCOPE) else {
+    let Ok(required) = StoragePath::new(V1_REQUIRED_STORAGE_SCOPE) else {
         return false;
     };
     claims.caps.iter().any(|capability| {
@@ -311,7 +310,7 @@ fn grant_covers_storage(claims: &GrantClaims) -> bool {
 
 /// Generate a canonical 256-bit challenge for handshakes and currentness proofs.
 #[must_use]
-pub fn v4_random_challenge() -> String {
+pub fn v1_random_challenge() -> String {
     let random = Keypair::random();
     let secret = Zeroizing::new(random.secret());
     URL_SAFE_NO_PAD.encode(&secret[..])
@@ -320,12 +319,12 @@ pub fn v4_random_challenge() -> String {
 /// Root-signed Pubky 0.11 Grant authorization carried verbatim as a compact JWS.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct V4GrantAuthorization {
+pub struct V1GrantAuthorization {
     /// Exact canonical `pubky-grant` JWS issued by the Pubky identity.
     pub grant_jws: String,
 }
 
-impl V4GrantAuthorization {
+impl V1GrantAuthorization {
     /// Construct and fully verify an authorization.
     ///
     /// # Errors
@@ -351,47 +350,47 @@ impl V4GrantAuthorization {
     /// Returns an error when any format, signature, identity, time, count, or capability check
     /// fails.
     pub fn verify(&self, expected_identity: &str, now: u64) -> Result<GrantClaims> {
-        if self.grant_jws.is_empty() || self.grant_jws.len() > V4_MAX_GRANT_JWS_BYTES {
-            return Err(ProtocolError::InvalidEncoding("v4 Grant JWS size"));
+        if self.grant_jws.is_empty() || self.grant_jws.len() > V1_MAX_GRANT_JWS_BYTES {
+            return Err(ProtocolError::InvalidEncoding("v1 Grant JWS size"));
         }
 
         let mut parts = self.grant_jws.split('.');
         let header_segment = parts
             .next()
-            .ok_or(ProtocolError::InvalidEncoding("v4 Grant JWS"))?;
+            .ok_or(ProtocolError::InvalidEncoding("v1 Grant JWS"))?;
         let payload_segment = parts
             .next()
-            .ok_or(ProtocolError::InvalidEncoding("v4 Grant JWS"))?;
+            .ok_or(ProtocolError::InvalidEncoding("v1 Grant JWS"))?;
         let signature_segment = parts
             .next()
-            .ok_or(ProtocolError::InvalidEncoding("v4 Grant JWS"))?;
+            .ok_or(ProtocolError::InvalidEncoding("v1 Grant JWS"))?;
         if parts.next().is_some()
             || header_segment.is_empty()
             || payload_segment.is_empty()
             || signature_segment.is_empty()
         {
-            return Err(ProtocolError::InvalidEncoding("v4 Grant JWS"));
+            return Err(ProtocolError::InvalidEncoding("v1 Grant JWS"));
         }
 
-        let header_bytes = decode_canonical_base64(header_segment, "v4 Grant header")?;
-        let header: V4GrantHeader = serde_json::from_slice(&header_bytes)?;
+        let header_bytes = decode_canonical_base64(header_segment, "v1 Grant header")?;
+        let header: V1GrantHeader = serde_json::from_slice(&header_bytes)?;
         if header.alg != "EdDSA"
             || header.typ != "pubky-grant"
-            || header_bytes != V4_GRANT_HEADER_JSON
+            || header_bytes != V1_GRANT_HEADER_JSON
         {
-            return Err(ProtocolError::InvalidEncoding("canonical v4 Grant header"));
+            return Err(ProtocolError::InvalidEncoding("canonical v1 Grant header"));
         }
 
-        let payload_bytes = decode_canonical_base64(payload_segment, "v4 Grant payload")?;
-        let wire: V4GrantClaimsWire = serde_json::from_slice(&payload_bytes)?;
+        let payload_bytes = decode_canonical_base64(payload_segment, "v1 Grant payload")?;
+        let wire: V1GrantClaimsWire = serde_json::from_slice(&payload_bytes)?;
         if serde_json::to_vec(&wire)? != payload_bytes {
-            return Err(ProtocolError::InvalidEncoding("canonical v4 Grant payload"));
+            return Err(ProtocolError::InvalidEncoding("canonical v1 Grant payload"));
         }
         let claims = wire.into_claims();
 
-        let signature_bytes = decode_canonical_base64(signature_segment, "v4 Grant signature")?;
+        let signature_bytes = decode_canonical_base64(signature_segment, "v1 Grant signature")?;
         let signature = Signature::from_slice(&signature_bytes)
-            .map_err(|_| ProtocolError::InvalidEncoding("v4 Grant signature"))?;
+            .map_err(|_| ProtocolError::InvalidEncoding("v1 Grant signature"))?;
         let signing_input = format!("{header_segment}.{payload_segment}");
         claims
             .iss
@@ -403,14 +402,14 @@ impl V4GrantAuthorization {
             return Err(ProtocolError::IdentityMismatch);
         }
         if claims.cnf == claims.iss {
-            return Err(ProtocolError::InvalidEncoding("independent v4 Grant cnf"));
+            return Err(ProtocolError::InvalidEncoding("independent v1 Grant cnf"));
         }
         validate_bounded_window(
             claims.iat,
             claims.exp,
             now,
-            V4_MAX_GRANT_LIFETIME_SECONDS,
-            "v4 Grant lifetime",
+            V1_MAX_GRANT_LIFETIME_SECONDS,
+            "v1 Grant lifetime",
         )?;
         let client_id = claims.client_id.as_str();
         if client_id.is_empty()
@@ -418,10 +417,10 @@ impl V4GrantAuthorization {
             || client_id.chars().any(char::is_control)
             || client_id.chars().all(char::is_whitespace)
         {
-            return Err(ProtocolError::InvalidEncoding("v4 Grant client id"));
+            return Err(ProtocolError::InvalidEncoding("v1 Grant client id"));
         }
-        if claims.caps.is_empty() || claims.caps.len() > V4_MAX_GRANT_CAPABILITIES {
-            return Err(ProtocolError::InvalidEncoding("v4 Grant capabilities"));
+        if claims.caps.is_empty() || claims.caps.len() > V1_MAX_GRANT_CAPABILITIES {
+            return Err(ProtocolError::InvalidEncoding("v1 Grant capabilities"));
         }
         let mut capabilities = BTreeSet::new();
         if claims
@@ -430,12 +429,12 @@ impl V4GrantAuthorization {
             .any(|capability| !capabilities.insert(capability.to_string()))
         {
             return Err(ProtocolError::InvalidEncoding(
-                "duplicate v4 Grant capability",
+                "duplicate v1 Grant capability",
             ));
         }
         if !grant_covers_storage(&claims) {
             return Err(ProtocolError::MissingCapability(format!(
-                "{V4_REQUIRED_STORAGE_SCOPE}:w"
+                "{V1_REQUIRED_STORAGE_SCOPE}:w"
             )));
         }
         Ok(claims)
@@ -447,14 +446,14 @@ impl V4GrantAuthorization {
     ///
     /// Returns an error only if canonical serialization fails.
     pub fn digest(&self) -> Result<String> {
-        canonical_digest(V4_GRANT_DIGEST_DOMAIN, self)
+        canonical_digest(V1_GRANT_DIGEST_DOMAIN, self)
     }
 }
 
 /// Grant-`cnf`-signed device delegation claims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct V4DeviceCertificateClaims {
+pub struct V1DeviceCertificateClaims {
     /// Protocol version.
     pub version: u16,
     /// Pubky root identity that issued the Grant.
@@ -482,14 +481,14 @@ pub struct V4DeviceCertificateClaims {
 /// Device delegation signed by the Pubky Grant's `cnf` key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct V4DeviceCertificate {
+pub struct V1DeviceCertificate {
     /// Delegated public claims.
-    pub claims: V4DeviceCertificateClaims,
+    pub claims: V1DeviceCertificateClaims,
     /// Grant-`cnf` signature, canonical base64url without padding.
     pub signature: String,
 }
 
-impl V4DeviceCertificate {
+impl V1DeviceCertificate {
     fn control_public_key(&self) -> Result<PublicKey> {
         parse_public_key(&self.claims.control_signing_key)
     }
@@ -502,19 +501,19 @@ impl V4DeviceCertificate {
     /// certificates.
     pub fn verify(
         &self,
-        authorization: &V4GrantAuthorization,
+        authorization: &V1GrantAuthorization,
         expected_identity: &str,
         now: u64,
     ) -> Result<()> {
         let grant = authorization.verify(expected_identity, now)?;
-        if self.claims.version != V4_PROTOCOL_VERSION {
+        if self.claims.version != V1_PROTOCOL_VERSION {
             return Err(ProtocolError::UnsupportedVersion(self.claims.version));
         }
         if self.claims.identity != expected_identity || self.claims.identity != grant.iss.z32() {
             return Err(ProtocolError::IdentityMismatch);
         }
         validate_device_id(&self.claims.device_id)?;
-        validate_digest(&self.claims.grant_digest, "v4 Grant digest")?;
+        validate_digest(&self.claims.grant_digest, "v1 Grant digest")?;
         if self.claims.grant_digest != authorization.digest()?
             || self.claims.grant_jti != grant.jti.as_str()
             || self.claims.client_id != grant.client_id.as_str()
@@ -526,8 +525,8 @@ impl V4DeviceCertificate {
             self.claims.issued_at,
             self.claims.expires_at,
             now,
-            V4_MAX_DEVICE_CERTIFICATE_LIFETIME_SECONDS,
-            "v4 certificate lifetime",
+            V1_MAX_DEVICE_CERTIFICATE_LIFETIME_SECONDS,
+            "v1 certificate lifetime",
         )?;
         if self.claims.issued_at < grant.iat || self.claims.expires_at > grant.exp {
             return Err(ProtocolError::InvalidTimeWindow);
@@ -543,9 +542,9 @@ impl V4DeviceCertificate {
             || iroh == cnf
             || cnf != grant.cnf
         {
-            return Err(ProtocolError::InvalidEncoding("independent v4 device keys"));
+            return Err(ProtocolError::InvalidEncoding("independent v1 device keys"));
         }
-        verify_signature(&cnf, V4_CERTIFICATE_DOMAIN, &self.claims, &self.signature)
+        verify_signature(&cnf, V1_CERTIFICATE_DOMAIN, &self.claims, &self.signature)
     }
 
     /// Domain-separated digest bound by locators, records, and currentness proofs.
@@ -554,7 +553,7 @@ impl V4DeviceCertificate {
     ///
     /// Returns an error only if canonical serialization fails.
     pub fn digest(&self) -> Result<String> {
-        canonical_digest(V4_CERTIFICATE_DIGEST_DOMAIN, self)
+        canonical_digest(V1_CERTIFICATE_DIGEST_DOMAIN, self)
     }
 }
 
@@ -563,19 +562,19 @@ impl V4DeviceCertificate {
 /// This type lets a nonextractable browser/WebCrypto `cnf` key sign the certificate without
 /// exposing that private key to the protocol library.
 #[derive(Clone, ZeroizeOnDrop)]
-pub struct V4DeviceCredentialDraft {
+pub struct V1DeviceCredentialDraft {
     #[zeroize(skip)]
-    authorization: V4GrantAuthorization,
+    authorization: V1GrantAuthorization,
     #[zeroize(skip)]
-    certificate_claims: V4DeviceCertificateClaims,
+    certificate_claims: V1DeviceCertificateClaims,
     control_signing_secret: String,
     iroh_secret: String,
 }
 
-impl fmt::Debug for V4DeviceCredentialDraft {
+impl fmt::Debug for V1DeviceCredentialDraft {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("V4DeviceCredentialDraft")
+            .debug_struct("V1DeviceCredentialDraft")
             .field("authorization", &self.authorization)
             .field("certificate_claims", &self.certificate_claims)
             .field("control_signing_secret", &"[REDACTED]")
@@ -584,10 +583,10 @@ impl fmt::Debug for V4DeviceCredentialDraft {
     }
 }
 
-impl V4DeviceCredentialDraft {
+impl V1DeviceCredentialDraft {
     /// Public claims the external Grant-`cnf` signer is authorizing.
     #[must_use]
-    pub fn certificate_claims(&self) -> &V4DeviceCertificateClaims {
+    pub fn certificate_claims(&self) -> &V1DeviceCertificateClaims {
         &self.certificate_claims
     }
 
@@ -599,7 +598,7 @@ impl V4DeviceCredentialDraft {
     ///
     /// Returns an error only if canonical serialization fails.
     pub fn certificate_signing_bytes(&self) -> Result<Vec<u8>> {
-        canonical_for_signing(V4_CERTIFICATE_DOMAIN, &self.certificate_claims)
+        canonical_for_signing(V1_CERTIFICATE_DOMAIN, &self.certificate_claims)
     }
 
     /// Consume the draft, attach a raw Ed25519 `cnf` signature, and verify the complete chain.
@@ -608,14 +607,14 @@ impl V4DeviceCredentialDraft {
     ///
     /// Returns an error unless the signature is exactly 64 bytes and verifies under the Grant's
     /// `cnf` key over [`Self::certificate_signing_bytes`].
-    pub fn finalize(self, signature: impl AsRef<[u8]>) -> Result<V4DeviceCredential> {
+    pub fn finalize(self, signature: impl AsRef<[u8]>) -> Result<V1DeviceCredential> {
         let signature = Signature::from_slice(signature.as_ref())
-            .map_err(|_| ProtocolError::InvalidEncoding("v4 certificate signature"))?;
+            .map_err(|_| ProtocolError::InvalidEncoding("v1 certificate signature"))?;
         // This type zeroizes on drop, so clone the two secrets into their final owner and let the
         // draft wipe its originals at the end of this method.
-        let credential = V4DeviceCredential {
+        let credential = V1DeviceCredential {
             authorization: self.authorization.clone(),
-            certificate: V4DeviceCertificate {
+            certificate: V1DeviceCertificate {
                 claims: self.certificate_claims.clone(),
                 signature: encode_signature(&signature),
             },
@@ -627,26 +626,26 @@ impl V4DeviceCredentialDraft {
     }
 }
 
-/// Serializable v4 device state. Persist only in protected, owner-controlled storage.
+/// Serializable v1 device state. Persist only in protected, owner-controlled storage.
 #[derive(Clone, Serialize, Deserialize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
-pub struct V4DeviceCredential {
+pub struct V1DeviceCredential {
     /// Root-signed Grant authorization.
     #[zeroize(skip)]
-    pub authorization: V4GrantAuthorization,
+    pub authorization: V1GrantAuthorization,
     /// Grant-`cnf`-signed public device delegation.
     #[zeroize(skip)]
-    pub certificate: V4DeviceCertificate,
+    pub certificate: V1DeviceCertificate,
     /// Device control secret, canonical base64url without padding.
     control_signing_secret: String,
     /// Independent iroh secret, canonical base64url without padding.
     iroh_secret: String,
 }
 
-impl fmt::Debug for V4DeviceCredential {
+impl fmt::Debug for V1DeviceCredential {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("V4DeviceCredential")
+            .debug_struct("V1DeviceCredential")
             .field("authorization", &self.authorization)
             .field("certificate", &self.certificate)
             .field("control_signing_secret", &"[REDACTED]")
@@ -655,7 +654,7 @@ impl fmt::Debug for V4DeviceCredential {
     }
 }
 
-impl V4DeviceCredential {
+impl V1DeviceCredential {
     /// Prepare fresh independent device keys and bounded certificate claims for external signing.
     ///
     /// The returned draft exposes only purpose-specific certificate signing bytes. This supports
@@ -665,12 +664,12 @@ impl V4DeviceCredential {
     ///
     /// Returns an error if the Grant, identity, device id, or requested lifetime is invalid.
     pub fn prepare(
-        authorization: V4GrantAuthorization,
+        authorization: V1GrantAuthorization,
         expected_identity: &str,
         device_id: impl Into<String>,
         issued_at: u64,
         expires_at: u64,
-    ) -> Result<V4DeviceCredentialDraft> {
+    ) -> Result<V1DeviceCredentialDraft> {
         let grant = authorization.verify(expected_identity, issued_at)?;
         let device_id = device_id.into();
         validate_device_id(&device_id)?;
@@ -678,8 +677,8 @@ impl V4DeviceCredential {
             issued_at,
             expires_at,
             issued_at,
-            V4_MAX_DEVICE_CERTIFICATE_LIFETIME_SECONDS,
-            "v4 certificate lifetime",
+            V1_MAX_DEVICE_CERTIFICATE_LIFETIME_SECONDS,
+            "v1 certificate lifetime",
         )?;
         if issued_at < grant.iat || expires_at > grant.exp {
             return Err(ProtocolError::InvalidTimeWindow);
@@ -689,9 +688,9 @@ impl V4DeviceCredential {
         let iroh = Keypair::random();
         let control_secret = Zeroizing::new(control.secret());
         let iroh_secret = Zeroizing::new(iroh.secret());
-        Ok(V4DeviceCredentialDraft {
-            certificate_claims: V4DeviceCertificateClaims {
-                version: V4_PROTOCOL_VERSION,
+        Ok(V1DeviceCredentialDraft {
+            certificate_claims: V1DeviceCertificateClaims {
+                version: V1_PROTOCOL_VERSION,
                 identity: grant.iss.z32(),
                 grant_digest: authorization.digest()?,
                 grant_jti: grant.jti.as_str().to_owned(),
@@ -721,7 +720,7 @@ impl V4DeviceCredential {
         reason = "all Grant, identity, and device validity inputs are security-relevant"
     )]
     pub fn issue(
-        authorization: V4GrantAuthorization,
+        authorization: V1GrantAuthorization,
         expected_identity: &str,
         grant_cnf: &Keypair,
         device_id: impl Into<String>,
@@ -796,7 +795,7 @@ impl V4DeviceCredential {
         Self::decode_secret(
             &self.control_signing_secret,
             self.control_signing_key(),
-            "v4 control-signing secret",
+            "v1 control-signing secret",
         )
     }
 
@@ -810,7 +809,7 @@ impl V4DeviceCredential {
     #[doc(hidden)]
     pub fn iroh_secret_key_bytes(&self) -> Result<Zeroizing<[u8; 32]>> {
         let key =
-            Self::decode_secret(&self.iroh_secret, self.iroh_endpoint_id(), "v4 iroh secret")?;
+            Self::decode_secret(&self.iroh_secret, self.iroh_endpoint_id(), "v1 iroh secret")?;
         Ok(Zeroizing::new(key.secret()))
     }
 }
@@ -818,7 +817,7 @@ impl V4DeviceCredential {
 /// Device-control-key-signed, relay-only iroh locator claims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct V4LocatorClaims {
+pub struct V1LocatorClaims {
     /// Protocol version.
     pub version: u16,
     /// Pubky identity owning this record.
@@ -833,7 +832,7 @@ pub struct V4LocatorClaims {
     pub iroh_endpoint_id: String,
     /// Relay URLs used for initial contact; direct addresses are never published.
     pub relay_urls: Vec<Url>,
-    /// Fixed v4 application-layer protocol identifier.
+    /// Fixed v1 application-layer protocol identifier.
     pub alpn: String,
     /// Canonical random endpoint-instance challenge.
     pub instance_nonce: String,
@@ -845,17 +844,17 @@ pub struct V4LocatorClaims {
     pub expires_at: u64,
 }
 
-/// Control-key-signed v4 iroh locator.
+/// Control-key-signed v1 iroh locator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct V4SignedLocator {
+pub struct V1SignedLocator {
     /// Signed locator claims.
-    pub claims: V4LocatorClaims,
+    pub claims: V1LocatorClaims,
     /// Device-control signature, canonical base64url without padding.
     pub signature: String,
 }
 
-impl V4SignedLocator {
+impl V1SignedLocator {
     /// Sign a production relay-only locator.
     ///
     /// # Errors
@@ -863,7 +862,7 @@ impl V4SignedLocator {
     /// Returns an error for malformed relays/challenges, stale credentials, invalid sequence or
     /// lifetime, or encoding failure.
     pub fn sign(
-        credential: &V4DeviceCredential,
+        credential: &V1DeviceCredential,
         relay_urls: Vec<Url>,
         instance_nonce: impl Into<String>,
         sequence: u64,
@@ -886,7 +885,7 @@ impl V4SignedLocator {
     ///
     /// Returns the same validation and signing errors as [`Self::sign`].
     pub fn sign_for_local_development(
-        credential: &V4DeviceCredential,
+        credential: &V1DeviceCredential,
         relay_urls: Vec<Url>,
         instance_nonce: impl Into<String>,
         sequence: u64,
@@ -904,7 +903,7 @@ impl V4SignedLocator {
     }
 
     fn sign_with_policy(
-        credential: &V4DeviceCredential,
+        credential: &V1DeviceCredential,
         relay_urls: Vec<Url>,
         instance_nonce: impl Into<String>,
         sequence: u64,
@@ -913,15 +912,15 @@ impl V4SignedLocator {
     ) -> Result<Self> {
         let (issued_at, expires_at) = validity;
         credential.verify(issued_at)?;
-        let claims = V4LocatorClaims {
-            version: V4_PROTOCOL_VERSION,
+        let claims = V1LocatorClaims {
+            version: V1_PROTOCOL_VERSION,
             identity: credential.identity().to_owned(),
             grant_digest: credential.authorization.digest()?,
             device_certificate_digest: credential.certificate.digest()?,
             control_signing_key: credential.control_signing_key().to_owned(),
             iroh_endpoint_id: credential.iroh_endpoint_id().to_owned(),
             relay_urls,
-            alpn: V4_IROH_ALPN_TEXT.to_owned(),
+            alpn: V1_IROH_ALPN_TEXT.to_owned(),
             instance_nonce: instance_nonce.into(),
             sequence,
             issued_at,
@@ -938,7 +937,7 @@ impl V4SignedLocator {
         )?;
         let signature = credential
             .control_key()?
-            .sign(&canonical_for_signing(V4_LOCATOR_DOMAIN, &claims)?);
+            .sign(&canonical_for_signing(V1_LOCATOR_DOMAIN, &claims)?);
         Ok(Self {
             claims,
             signature: encode_signature(&signature),
@@ -950,23 +949,23 @@ impl V4SignedLocator {
         reason = "verification keeps every authorization and rollback input explicit"
     )]
     fn validate_claims(
-        claims: &V4LocatorClaims,
-        authorization: &V4GrantAuthorization,
-        certificate: &V4DeviceCertificate,
+        claims: &V1LocatorClaims,
+        authorization: &V1GrantAuthorization,
+        certificate: &V1DeviceCertificate,
         expected_identity: &str,
         now: u64,
         allow_loopback_dev: bool,
         minimum_sequence: Option<u64>,
     ) -> Result<()> {
-        if claims.version != V4_PROTOCOL_VERSION {
+        if claims.version != V1_PROTOCOL_VERSION {
             return Err(ProtocolError::UnsupportedVersion(claims.version));
         }
         certificate.verify(authorization, expected_identity, now)?;
         if claims.identity != expected_identity || claims.identity != certificate.claims.identity {
             return Err(ProtocolError::IdentityMismatch);
         }
-        validate_digest(&claims.grant_digest, "v4 Grant digest")?;
-        validate_digest(&claims.device_certificate_digest, "v4 certificate digest")?;
+        validate_digest(&claims.grant_digest, "v1 Grant digest")?;
+        validate_digest(&claims.device_certificate_digest, "v1 certificate digest")?;
         if claims.grant_digest != authorization.digest()?
             || claims.device_certificate_digest != certificate.digest()?
             || claims.control_signing_key != certificate.claims.control_signing_key
@@ -974,21 +973,21 @@ impl V4SignedLocator {
         {
             return Err(ProtocolError::DeviceMismatch);
         }
-        if claims.alpn != V4_IROH_ALPN_TEXT {
-            return Err(ProtocolError::InvalidEncoding("v4 ALPN"));
+        if claims.alpn != V1_IROH_ALPN_TEXT {
+            return Err(ProtocolError::InvalidEncoding("v1 ALPN"));
         }
         if claims.sequence == 0 || minimum_sequence.is_some_and(|minimum| claims.sequence < minimum)
         {
-            return Err(ProtocolError::InvalidEncoding("v4 locator sequence"));
+            return Err(ProtocolError::InvalidEncoding("v1 locator sequence"));
         }
-        validate_challenge(&claims.instance_nonce, "v4 instance nonce")?;
+        validate_challenge(&claims.instance_nonce, "v1 instance nonce")?;
         validate_relays(&claims.relay_urls, allow_loopback_dev)?;
         validate_bounded_window(
             claims.issued_at,
             claims.expires_at,
             now,
-            V4_MAX_LOCATOR_LIFETIME_SECONDS,
-            "v4 locator lifetime",
+            V1_MAX_LOCATOR_LIFETIME_SECONDS,
+            "v1 locator lifetime",
         )?;
         if claims.issued_at < certificate.claims.issued_at
             || claims.expires_at > certificate.claims.expires_at
@@ -1006,8 +1005,8 @@ impl V4SignedLocator {
     /// Returns an error for malformed, stale, cross-device, rollback, or tampered locators.
     pub fn verify(
         &self,
-        authorization: &V4GrantAuthorization,
-        certificate: &V4DeviceCertificate,
+        authorization: &V1GrantAuthorization,
+        certificate: &V1DeviceCertificate,
         expected_identity: &str,
         now: u64,
         allow_loopback_dev: bool,
@@ -1024,7 +1023,7 @@ impl V4SignedLocator {
         )?;
         verify_signature(
             &certificate.control_public_key()?,
-            V4_LOCATOR_DOMAIN,
+            V1_LOCATOR_DOMAIN,
             &self.claims,
             &self.signature,
         )
@@ -1036,12 +1035,12 @@ impl V4SignedLocator {
     ///
     /// Returns an error only if canonical serialization fails.
     pub fn digest(&self) -> Result<String> {
-        canonical_digest(V4_LOCATOR_DIGEST_DOMAIN, self)
+        canonical_digest(V1_LOCATOR_DIGEST_DOMAIN, self)
     }
 }
 
 #[derive(Serialize)]
-struct V4DevicePathInput<'a> {
+struct V1DevicePathInput<'a> {
     grant_cnf_key: &'a str,
     control_signing_key: &'a str,
 }
@@ -1051,38 +1050,38 @@ struct V4DevicePathInput<'a> {
 /// # Errors
 ///
 /// Returns an error unless both keys are canonical Pubky/Ed25519 z-base-32 keys.
-pub fn v4_device_record_path(grant_cnf_key: &str, control_signing_key: &str) -> Result<String> {
+pub fn v1_device_record_path(grant_cnf_key: &str, control_signing_key: &str) -> Result<String> {
     parse_public_key(grant_cnf_key)?;
     parse_public_key(control_signing_key)?;
-    let input = V4DevicePathInput {
+    let input = V1DevicePathInput {
         grant_cnf_key,
         control_signing_key,
     };
-    let digest = canonical_digest(V4_DEVICE_PATH_DOMAIN, &input)?;
-    Ok(format!("{V4_DEVICE_RECORD_PATH_PREFIX}{digest}.json"))
+    let digest = canonical_digest(V1_DEVICE_PATH_DOMAIN, &input)?;
+    Ok(format!("{V1_DEVICE_RECORD_PATH_PREFIX}{digest}.json"))
 }
 
-/// Self-contained homeserver publication for one v4 device.
+/// Self-contained homeserver publication for one v1 device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct V4DeviceRecord {
+pub struct V1DeviceRecord {
     /// Root-signed Pubky Grant authorization.
-    pub authorization: V4GrantAuthorization,
+    pub authorization: V1GrantAuthorization,
     /// Grant-`cnf`-signed device certificate.
-    pub certificate: V4DeviceCertificate,
+    pub certificate: V1DeviceCertificate,
     /// Device-control-key-signed relay-only locator.
-    pub locator: V4SignedLocator,
+    pub locator: V1SignedLocator,
 }
 
-impl V4DeviceRecord {
+impl V1DeviceRecord {
     /// Build and verify a self-contained record from one credential and locator.
     ///
     /// # Errors
     ///
     /// Returns an error for a mismatched or invalid locator, chain, or encoded size.
     pub fn new(
-        credential: &V4DeviceCredential,
-        locator: V4SignedLocator,
+        credential: &V1DeviceCredential,
+        locator: V1SignedLocator,
         now: u64,
         allow_loopback_dev: bool,
     ) -> Result<Self> {
@@ -1107,8 +1106,8 @@ impl V4DeviceRecord {
         allow_loopback_dev: bool,
         minimum_sequence: Option<u64>,
     ) -> Result<Self> {
-        if input.len() > V4_MAX_DEVICE_RECORD_BYTES {
-            return Err(ProtocolError::InvalidEncoding("v4 device record size"));
+        if input.len() > V1_MAX_DEVICE_RECORD_BYTES {
+            return Err(ProtocolError::InvalidEncoding("v1 device record size"));
         }
         let record: Self = serde_json::from_slice(input)?;
         record.verify(expected_identity, now, allow_loopback_dev, minimum_sequence)?;
@@ -1127,7 +1126,7 @@ impl V4DeviceRecord {
         allow_loopback_dev: bool,
         minimum_sequence: Option<u64>,
     ) -> Result<()> {
-        ensure_serialized_bound(self, V4_MAX_DEVICE_RECORD_BYTES, "v4 device record size")?;
+        ensure_serialized_bound(self, V1_MAX_DEVICE_RECORD_BYTES, "v1 device record size")?;
         self.certificate
             .verify(&self.authorization, expected_identity, now)?;
         self.locator.verify(
@@ -1146,7 +1145,7 @@ impl V4DeviceRecord {
     ///
     /// Returns an error only if canonical serialization fails.
     pub fn digest(&self) -> Result<String> {
-        canonical_digest(V4_DEVICE_RECORD_DIGEST_DOMAIN, self)
+        canonical_digest(V1_DEVICE_RECORD_DIGEST_DOMAIN, self)
     }
 
     /// Hash-derived public-storage path for this record.
@@ -1155,21 +1154,21 @@ impl V4DeviceRecord {
     ///
     /// Returns an error if either path key is malformed.
     pub fn path(&self) -> Result<String> {
-        v4_device_record_path(
+        v1_device_record_path(
             &self.certificate.claims.grant_cnf_key,
             &self.certificate.claims.control_signing_key,
         )
     }
 }
 
-/// Initiator-signed v4 connection Hello claims.
+/// Initiator-signed v1 connection Hello claims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct V4HelloClaims {
+pub struct V1HelloClaims {
     /// Protocol version.
     pub version: u16,
     /// Exact self-contained initiator publication for offline verification.
-    pub from_device_record: V4DeviceRecord,
+    pub from_device_record: V1DeviceRecord,
     /// Initiator Pubky identity.
     pub from_identity: String,
     /// Initiator device id.
@@ -1188,7 +1187,7 @@ pub struct V4HelloClaims {
     pub to_iroh_endpoint_id: String,
     /// Bounded application protocol selected inside the fixed QUIC ALPN.
     pub application: String,
-    /// Fixed v4 ALPN.
+    /// Fixed v1 ALPN.
     pub alpn: String,
     /// Canonical fresh initiator nonce.
     pub session_nonce: String,
@@ -1200,26 +1199,26 @@ pub struct V4HelloClaims {
     pub expires_at: u64,
 }
 
-/// Device-control-key-signed v4 connection Hello.
+/// Device-control-key-signed v1 connection Hello.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct V4SignedHello {
+pub struct V1SignedHello {
     /// Signed Hello claims.
-    pub claims: V4HelloClaims,
+    pub claims: V1HelloClaims,
     /// Initiator control signature, canonical base64url without padding.
     pub signature: String,
 }
 
-impl V4SignedHello {
+impl V1SignedHello {
     /// Create a Hello carrying the exact sender record and binding the exact target record.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid publications, application, nonce, lifetime, or signing.
     pub fn sign(
-        credential: &V4DeviceCredential,
-        sender_record: &V4DeviceRecord,
-        target_record: &V4DeviceRecord,
+        credential: &V1DeviceCredential,
+        sender_record: &V1DeviceRecord,
+        target_record: &V1DeviceRecord,
         application: impl Into<String>,
         session_nonce: impl Into<String>,
         validity: (u64, u64),
@@ -1241,9 +1240,9 @@ impl V4SignedHello {
     ///
     /// Returns the same validation and signing errors as [`Self::sign`].
     pub fn sign_for_local_development(
-        credential: &V4DeviceCredential,
-        sender_record: &V4DeviceRecord,
-        target_record: &V4DeviceRecord,
+        credential: &V1DeviceCredential,
+        sender_record: &V1DeviceRecord,
+        target_record: &V1DeviceRecord,
         application: impl Into<String>,
         session_nonce: impl Into<String>,
         validity: (u64, u64),
@@ -1264,9 +1263,9 @@ impl V4SignedHello {
         reason = "both exact publications and local-only relay policy are explicit"
     )]
     fn sign_with_policy(
-        credential: &V4DeviceCredential,
-        sender_record: &V4DeviceRecord,
-        target_record: &V4DeviceRecord,
+        credential: &V1DeviceCredential,
+        sender_record: &V1DeviceRecord,
+        target_record: &V1DeviceRecord,
         application: impl Into<String>,
         session_nonce: impl Into<String>,
         validity: (u64, u64),
@@ -1287,8 +1286,8 @@ impl V4SignedHello {
         )?;
         let sender = &credential.certificate.claims;
         let target = &target_record.certificate.claims;
-        let claims = V4HelloClaims {
-            version: V4_PROTOCOL_VERSION,
+        let claims = V1HelloClaims {
+            version: V1_PROTOCOL_VERSION,
             from_device_record: sender_record.clone(),
             from_identity: sender.identity.clone(),
             from_device_id: sender.device_id.clone(),
@@ -1299,7 +1298,7 @@ impl V4SignedHello {
             to_control_signing_key: target.control_signing_key.clone(),
             to_iroh_endpoint_id: target.iroh_endpoint_id.clone(),
             application: application.into(),
-            alpn: V4_IROH_ALPN_TEXT.to_owned(),
+            alpn: V1_IROH_ALPN_TEXT.to_owned(),
             session_nonce: session_nonce.into(),
             target_device_record_digest: target_record.digest()?,
             issued_at,
@@ -1315,27 +1314,27 @@ impl V4SignedHello {
         )?;
         let signature = credential
             .control_key()?
-            .sign(&canonical_for_signing(V4_HELLO_DOMAIN, &claims)?);
+            .sign(&canonical_for_signing(V1_HELLO_DOMAIN, &claims)?);
         let hello = Self {
             claims,
             signature: encode_signature(&signature),
         };
-        ensure_serialized_bound(&hello, V4_MAX_HELLO_BYTES, "v4 Hello size")?;
+        ensure_serialized_bound(&hello, V1_MAX_HELLO_BYTES, "v1 Hello size")?;
         Ok(hello)
     }
 
     fn validate_core(
-        claims: &V4HelloClaims,
-        sender_record: &V4DeviceRecord,
-        target_record: &V4DeviceRecord,
+        claims: &V1HelloClaims,
+        sender_record: &V1DeviceRecord,
+        target_record: &V1DeviceRecord,
         expected_application: &str,
         now: u64,
         allow_loopback_dev: bool,
     ) -> Result<()> {
-        if claims.version != V4_PROTOCOL_VERSION {
+        if claims.version != V1_PROTOCOL_VERSION {
             return Err(ProtocolError::UnsupportedVersion(claims.version));
         }
-        ensure_serialized_bound(claims, V4_MAX_HELLO_BYTES, "v4 Hello size")?;
+        ensure_serialized_bound(claims, V1_MAX_HELLO_BYTES, "v1 Hello size")?;
         if &claims.from_device_record != sender_record {
             return Err(ProtocolError::DeviceMismatch);
         }
@@ -1359,15 +1358,15 @@ impl V4SignedHello {
         }
         validate_application(&claims.application)?;
         if claims.application != expected_application {
-            return Err(ProtocolError::InvalidEncoding("v4 application binding"));
+            return Err(ProtocolError::InvalidEncoding("v1 application binding"));
         }
-        if claims.alpn != V4_IROH_ALPN_TEXT {
-            return Err(ProtocolError::InvalidEncoding("v4 ALPN"));
+        if claims.alpn != V1_IROH_ALPN_TEXT {
+            return Err(ProtocolError::InvalidEncoding("v1 ALPN"));
         }
-        validate_challenge(&claims.session_nonce, "v4 session nonce")?;
+        validate_challenge(&claims.session_nonce, "v1 session nonce")?;
         validate_digest(
             &claims.target_device_record_digest,
-            "v4 target device digest",
+            "v1 target device digest",
         )?;
         if claims.target_device_record_digest != target_record.digest()? {
             return Err(ProtocolError::DeviceMismatch);
@@ -1376,8 +1375,8 @@ impl V4SignedHello {
             claims.issued_at,
             claims.expires_at,
             now,
-            V4_MAX_HANDSHAKE_LIFETIME_SECONDS,
-            "v4 Hello lifetime",
+            V1_MAX_HANDSHAKE_LIFETIME_SECONDS,
+            "v1 Hello lifetime",
         )?;
         if claims.issued_at < sender.issued_at
             || claims.issued_at < target.issued_at
@@ -1393,13 +1392,13 @@ impl V4SignedHello {
 
     fn verify_core(
         &self,
-        sender_record: &V4DeviceRecord,
-        target_record: &V4DeviceRecord,
+        sender_record: &V1DeviceRecord,
+        target_record: &V1DeviceRecord,
         expected_application: &str,
         now: u64,
         allow_loopback_dev: bool,
     ) -> Result<()> {
-        ensure_serialized_bound(self, V4_MAX_HELLO_BYTES, "v4 Hello size")?;
+        ensure_serialized_bound(self, V1_MAX_HELLO_BYTES, "v1 Hello size")?;
         Self::validate_core(
             &self.claims,
             sender_record,
@@ -1410,7 +1409,7 @@ impl V4SignedHello {
         )?;
         verify_signature(
             &sender_record.certificate.control_public_key()?,
-            V4_HELLO_DOMAIN,
+            V1_HELLO_DOMAIN,
             &self.claims,
             &self.signature,
         )
@@ -1423,8 +1422,8 @@ impl V4SignedHello {
     /// Returns an error for malformed, expired, substituted, cross-device, or tampered Hello.
     pub fn verify(
         &self,
-        sender_record: &V4DeviceRecord,
-        target_record: &V4DeviceRecord,
+        sender_record: &V1DeviceRecord,
+        target_record: &V1DeviceRecord,
         expected_application: &str,
         now: u64,
         allow_loopback_dev: bool,
@@ -1444,14 +1443,14 @@ impl V4SignedHello {
     ///
     /// Returns an error only if canonical serialization fails.
     pub fn digest(&self) -> Result<String> {
-        canonical_digest(V4_HELLO_DIGEST_DOMAIN, self)
+        canonical_digest(V1_HELLO_DIGEST_DOMAIN, self)
     }
 }
 
-/// Responder-signed v4 acknowledgement claims.
+/// Responder-signed v1 acknowledgement claims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct V4AckClaims {
+pub struct V1AckClaims {
     /// Protocol version.
     pub version: u16,
     /// Responder Pubky identity.
@@ -1472,7 +1471,7 @@ pub struct V4AckClaims {
     pub to_iroh_endpoint_id: String,
     /// Application copied exactly from the Hello.
     pub application: String,
-    /// Fixed v4 ALPN.
+    /// Fixed v1 ALPN.
     pub alpn: String,
     /// Initiator nonce copied exactly from the Hello.
     pub session_nonce: String,
@@ -1488,27 +1487,27 @@ pub struct V4AckClaims {
     pub expires_at: u64,
 }
 
-/// Device-control-key-signed acknowledgement of one exact v4 Hello.
+/// Device-control-key-signed acknowledgement of one exact v1 Hello.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct V4SignedAck {
+pub struct V1SignedAck {
     /// Signed acknowledgement claims.
-    pub claims: V4AckClaims,
+    pub claims: V1AckClaims,
     /// Responder control signature, canonical base64url without padding.
     pub signature: String,
 }
 
-impl V4SignedAck {
+impl V1SignedAck {
     /// Sign an Ack after authenticating the exact Hello and both device records.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid Hello/device bindings, nonce, time, or signing.
     pub fn sign(
-        credential: &V4DeviceCredential,
-        hello: &V4SignedHello,
-        initiator_record: &V4DeviceRecord,
-        responder_record: &V4DeviceRecord,
+        credential: &V1DeviceCredential,
+        hello: &V1SignedHello,
+        initiator_record: &V1DeviceRecord,
+        responder_record: &V1DeviceRecord,
         responder_nonce: impl Into<String>,
         issued_at: u64,
         expires_at: u64,
@@ -1530,10 +1529,10 @@ impl V4SignedAck {
     ///
     /// Returns the same validation and signing errors as [`Self::sign`].
     pub fn sign_for_local_development(
-        credential: &V4DeviceCredential,
-        hello: &V4SignedHello,
-        initiator_record: &V4DeviceRecord,
-        responder_record: &V4DeviceRecord,
+        credential: &V1DeviceCredential,
+        hello: &V1SignedHello,
+        initiator_record: &V1DeviceRecord,
+        responder_record: &V1DeviceRecord,
         responder_nonce: impl Into<String>,
         issued_at: u64,
         expires_at: u64,
@@ -1554,10 +1553,10 @@ impl V4SignedAck {
         reason = "both exact publications and local-only relay policy are explicit"
     )]
     fn sign_with_policy(
-        credential: &V4DeviceCredential,
-        hello: &V4SignedHello,
-        initiator_record: &V4DeviceRecord,
-        responder_record: &V4DeviceRecord,
+        credential: &V1DeviceCredential,
+        hello: &V1SignedHello,
+        initiator_record: &V1DeviceRecord,
+        responder_record: &V1DeviceRecord,
         responder_nonce: impl Into<String>,
         validity: (u64, u64),
         allow_loopback_dev: bool,
@@ -1577,8 +1576,8 @@ impl V4SignedAck {
         )?;
         let responder = &responder_record.certificate.claims;
         let initiator = &initiator_record.certificate.claims;
-        let claims = V4AckClaims {
-            version: V4_PROTOCOL_VERSION,
+        let claims = V1AckClaims {
+            version: V1_PROTOCOL_VERSION,
             from_identity: responder.identity.clone(),
             from_device_id: responder.device_id.clone(),
             from_control_signing_key: responder.control_signing_key.clone(),
@@ -1588,7 +1587,7 @@ impl V4SignedAck {
             to_control_signing_key: initiator.control_signing_key.clone(),
             to_iroh_endpoint_id: initiator.iroh_endpoint_id.clone(),
             application: hello.claims.application.clone(),
-            alpn: V4_IROH_ALPN_TEXT.to_owned(),
+            alpn: V1_IROH_ALPN_TEXT.to_owned(),
             session_nonce: hello.claims.session_nonce.clone(),
             responder_nonce: responder_nonce.into(),
             hello_digest: hello.digest()?,
@@ -1608,12 +1607,12 @@ impl V4SignedAck {
         )?;
         let signature = credential
             .control_key()?
-            .sign(&canonical_for_signing(V4_ACK_DOMAIN, &claims)?);
+            .sign(&canonical_for_signing(V1_ACK_DOMAIN, &claims)?);
         let ack = Self {
             claims,
             signature: encode_signature(&signature),
         };
-        ensure_serialized_bound(&ack, V4_MAX_ACK_BYTES, "v4 Ack size")?;
+        ensure_serialized_bound(&ack, V1_MAX_ACK_BYTES, "v1 Ack size")?;
         Ok(ack)
     }
 
@@ -1622,16 +1621,16 @@ impl V4SignedAck {
         reason = "verification keeps both exact records and application policy explicit"
     )]
     fn validate_claims(
-        claims: &V4AckClaims,
-        responder_certificate: &V4DeviceCertificate,
-        initiator_record: &V4DeviceRecord,
-        responder_record: &V4DeviceRecord,
-        hello: &V4SignedHello,
+        claims: &V1AckClaims,
+        responder_certificate: &V1DeviceCertificate,
+        initiator_record: &V1DeviceRecord,
+        responder_record: &V1DeviceRecord,
+        hello: &V1SignedHello,
         expected_application: &str,
         now: u64,
         allow_loopback_dev: bool,
     ) -> Result<()> {
-        if claims.version != V4_PROTOCOL_VERSION {
+        if claims.version != V1_PROTOCOL_VERSION {
             return Err(ProtocolError::UnsupportedVersion(claims.version));
         }
         hello.verify_core(
@@ -1662,22 +1661,22 @@ impl V4SignedAck {
         if claims.application != expected_application
             || claims.application != hello.claims.application
         {
-            return Err(ProtocolError::InvalidEncoding("v4 application binding"));
+            return Err(ProtocolError::InvalidEncoding("v1 application binding"));
         }
-        if claims.alpn != V4_IROH_ALPN_TEXT || claims.alpn != hello.claims.alpn {
-            return Err(ProtocolError::InvalidEncoding("v4 ALPN"));
+        if claims.alpn != V1_IROH_ALPN_TEXT || claims.alpn != hello.claims.alpn {
+            return Err(ProtocolError::InvalidEncoding("v1 ALPN"));
         }
-        validate_challenge(&claims.session_nonce, "v4 session nonce")?;
-        validate_challenge(&claims.responder_nonce, "v4 responder nonce")?;
+        validate_challenge(&claims.session_nonce, "v1 session nonce")?;
+        validate_challenge(&claims.responder_nonce, "v1 responder nonce")?;
         if claims.session_nonce != hello.claims.session_nonce
             || claims.responder_nonce == claims.session_nonce
         {
-            return Err(ProtocolError::InvalidEncoding("v4 nonce binding"));
+            return Err(ProtocolError::InvalidEncoding("v1 nonce binding"));
         }
-        validate_digest(&claims.hello_digest, "v4 Hello digest")?;
+        validate_digest(&claims.hello_digest, "v1 Hello digest")?;
         validate_digest(
             &claims.responder_device_record_digest,
-            "v4 responder device digest",
+            "v1 responder device digest",
         )?;
         if claims.hello_digest != hello.digest()?
             || claims.responder_device_record_digest != responder_record.digest()?
@@ -1688,8 +1687,8 @@ impl V4SignedAck {
             claims.issued_at,
             claims.expires_at,
             now,
-            V4_MAX_HANDSHAKE_LIFETIME_SECONDS,
-            "v4 Ack lifetime",
+            V1_MAX_HANDSHAKE_LIFETIME_SECONDS,
+            "v1 Ack lifetime",
         )?;
         if claims.issued_at < hello.claims.issued_at
             || claims.expires_at > hello.claims.expires_at
@@ -1710,14 +1709,14 @@ impl V4SignedAck {
     /// Returns an error for malformed, stale, substituted, cross-device, or tampered Acks.
     pub fn verify(
         &self,
-        responder_record: &V4DeviceRecord,
-        initiator_record: &V4DeviceRecord,
-        hello: &V4SignedHello,
+        responder_record: &V1DeviceRecord,
+        initiator_record: &V1DeviceRecord,
+        hello: &V1SignedHello,
         expected_application: &str,
         now: u64,
         allow_loopback_dev: bool,
     ) -> Result<()> {
-        ensure_serialized_bound(self, V4_MAX_ACK_BYTES, "v4 Ack size")?;
+        ensure_serialized_bound(self, V1_MAX_ACK_BYTES, "v1 Ack size")?;
         Self::validate_claims(
             &self.claims,
             &responder_record.certificate,
@@ -1730,7 +1729,7 @@ impl V4SignedAck {
         )?;
         verify_signature(
             &responder_record.certificate.control_public_key()?,
-            V4_ACK_DOMAIN,
+            V1_ACK_DOMAIN,
             &self.claims,
             &self.signature,
         )
@@ -1740,7 +1739,7 @@ impl V4SignedAck {
 /// A participant's role in one currentness-proof exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum V4CurrentnessRole {
+pub enum V1CurrentnessRole {
     /// Peer that signed the Hello.
     Initiator,
     /// Peer that signed the Ack.
@@ -1750,11 +1749,11 @@ pub enum V4CurrentnessRole {
 /// Short-lived currentness claims. No peer Pubky identifier is stored in this record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct V4CurrentnessClaims {
+pub struct V1CurrentnessClaims {
     /// Protocol version.
     pub version: u16,
     /// Signer's handshake role.
-    pub role: V4CurrentnessRole,
+    pub role: V1CurrentnessRole,
     /// Fresh shared 128-bit-or-larger challenge.
     pub challenge: String,
     /// Digest of the exact signed Hello.
@@ -1774,16 +1773,16 @@ pub struct V4CurrentnessClaims {
 /// Device-control-key-signed currentness proof.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct V4SignedCurrentnessProof {
+pub struct V1SignedCurrentnessProof {
     /// Signed currentness claims.
-    pub claims: V4CurrentnessClaims,
+    pub claims: V1CurrentnessClaims,
     /// Device-control signature, canonical base64url without padding.
     pub signature: String,
 }
 
 #[derive(Serialize)]
-struct V4CurrentnessPathInput<'a> {
-    role: V4CurrentnessRole,
+struct V1CurrentnessPathInput<'a> {
+    role: V1CurrentnessRole,
     challenge: &'a str,
     hello_digest: &'a str,
     device_record_digest: &'a str,
@@ -1799,20 +1798,20 @@ struct V4CurrentnessPathInput<'a> {
 /// # Errors
 ///
 /// Returns an error if the challenge or any digest is malformed.
-pub fn v4_currentness_path(
-    role: V4CurrentnessRole,
+pub fn v1_currentness_path(
+    role: V1CurrentnessRole,
     challenge: &str,
     hello_digest: &str,
     device_record_digest: &str,
     grant_digest: &str,
     locator_digest: &str,
 ) -> Result<String> {
-    validate_challenge(challenge, "v4 currentness challenge")?;
-    validate_digest(hello_digest, "v4 Hello digest")?;
-    validate_digest(device_record_digest, "v4 device record digest")?;
-    validate_digest(grant_digest, "v4 Grant digest")?;
-    validate_digest(locator_digest, "v4 locator digest")?;
-    let input = V4CurrentnessPathInput {
+    validate_challenge(challenge, "v1 currentness challenge")?;
+    validate_digest(hello_digest, "v1 Hello digest")?;
+    validate_digest(device_record_digest, "v1 device record digest")?;
+    validate_digest(grant_digest, "v1 Grant digest")?;
+    validate_digest(locator_digest, "v1 locator digest")?;
+    let input = V1CurrentnessPathInput {
         role,
         challenge,
         hello_digest,
@@ -1820,22 +1819,22 @@ pub fn v4_currentness_path(
         grant_digest,
         locator_digest,
     };
-    let digest = canonical_digest(V4_CURRENTNESS_PATH_DOMAIN, &input)?;
-    Ok(format!("{V4_CURRENTNESS_PATH_PREFIX}{digest}.json"))
+    let digest = canonical_digest(V1_CURRENTNESS_PATH_DOMAIN, &input)?;
+    Ok(format!("{V1_CURRENTNESS_PATH_PREFIX}{digest}.json"))
 }
 
 fn records_for_role<'a>(
-    role: V4CurrentnessRole,
-    own_record: &'a V4DeviceRecord,
-    peer_record: &'a V4DeviceRecord,
-) -> (&'a V4DeviceRecord, &'a V4DeviceRecord) {
+    role: V1CurrentnessRole,
+    own_record: &'a V1DeviceRecord,
+    peer_record: &'a V1DeviceRecord,
+) -> (&'a V1DeviceRecord, &'a V1DeviceRecord) {
     match role {
-        V4CurrentnessRole::Initiator => (own_record, peer_record),
-        V4CurrentnessRole::Responder => (peer_record, own_record),
+        V1CurrentnessRole::Initiator => (own_record, peer_record),
+        V1CurrentnessRole::Responder => (peer_record, own_record),
     }
 }
 
-impl V4SignedCurrentnessProof {
+impl V1SignedCurrentnessProof {
     /// Sign a fresh proof for the exact Hello and the signer's exact current publication.
     ///
     /// # Errors
@@ -1846,11 +1845,11 @@ impl V4SignedCurrentnessProof {
         reason = "mutual-proof role, exact records, challenge, and validity are explicit"
     )]
     pub fn sign(
-        credential: &V4DeviceCredential,
-        own_record: &V4DeviceRecord,
-        peer_record: &V4DeviceRecord,
-        hello: &V4SignedHello,
-        role: V4CurrentnessRole,
+        credential: &V1DeviceCredential,
+        own_record: &V1DeviceRecord,
+        peer_record: &V1DeviceRecord,
+        hello: &V1SignedHello,
+        role: V1CurrentnessRole,
         challenge: impl Into<String>,
         issued_at: u64,
         expires_at: u64,
@@ -1869,8 +1868,8 @@ impl V4SignedCurrentnessProof {
             issued_at,
             allow_loopback_dev,
         )?;
-        let claims = V4CurrentnessClaims {
-            version: V4_PROTOCOL_VERSION,
+        let claims = V1CurrentnessClaims {
+            version: V1_PROTOCOL_VERSION,
             role,
             challenge: challenge.into(),
             hello_digest: hello.digest()?,
@@ -1892,15 +1891,15 @@ impl V4SignedCurrentnessProof {
         )?;
         let signature = credential
             .control_key()?
-            .sign(&canonical_for_signing(V4_CURRENTNESS_DOMAIN, &claims)?);
+            .sign(&canonical_for_signing(V1_CURRENTNESS_DOMAIN, &claims)?);
         let proof = Self {
             claims,
             signature: encode_signature(&signature),
         };
         ensure_serialized_bound(
             &proof,
-            V4_MAX_CURRENTNESS_PROOF_BYTES,
-            "v4 currentness proof size",
+            V1_MAX_CURRENTNESS_PROOF_BYTES,
+            "v1 currentness proof size",
         )?;
         Ok(proof)
     }
@@ -1910,26 +1909,26 @@ impl V4SignedCurrentnessProof {
         reason = "mutual-proof role, exact records, and expected challenge are explicit"
     )]
     fn validate_claims(
-        claims: &V4CurrentnessClaims,
-        own_record: &V4DeviceRecord,
-        peer_record: &V4DeviceRecord,
-        hello: &V4SignedHello,
-        expected_role: V4CurrentnessRole,
+        claims: &V1CurrentnessClaims,
+        own_record: &V1DeviceRecord,
+        peer_record: &V1DeviceRecord,
+        hello: &V1SignedHello,
+        expected_role: V1CurrentnessRole,
         expected_challenge: &str,
         now: u64,
         allow_loopback_dev: bool,
     ) -> Result<()> {
-        if claims.version != V4_PROTOCOL_VERSION {
+        if claims.version != V1_PROTOCOL_VERSION {
             return Err(ProtocolError::UnsupportedVersion(claims.version));
         }
         if claims.role != expected_role {
             return Err(ProtocolError::DeviceMismatch);
         }
-        validate_challenge(&claims.challenge, "v4 currentness challenge")?;
+        validate_challenge(&claims.challenge, "v1 currentness challenge")?;
         if claims.challenge != expected_challenge || claims.challenge == hello.claims.session_nonce
         {
             return Err(ProtocolError::InvalidEncoding(
-                "v4 currentness challenge binding",
+                "v1 currentness challenge binding",
             ));
         }
         let (initiator_record, responder_record) =
@@ -1941,10 +1940,10 @@ impl V4SignedCurrentnessProof {
             now,
             allow_loopback_dev,
         )?;
-        validate_digest(&claims.hello_digest, "v4 Hello digest")?;
-        validate_digest(&claims.device_record_digest, "v4 device record digest")?;
-        validate_digest(&claims.grant_digest, "v4 Grant digest")?;
-        validate_digest(&claims.locator_digest, "v4 locator digest")?;
+        validate_digest(&claims.hello_digest, "v1 Hello digest")?;
+        validate_digest(&claims.device_record_digest, "v1 device record digest")?;
+        validate_digest(&claims.grant_digest, "v1 Grant digest")?;
+        validate_digest(&claims.locator_digest, "v1 locator digest")?;
         if claims.hello_digest != hello.digest()?
             || claims.device_record_digest != own_record.digest()?
             || claims.grant_digest != own_record.authorization.digest()?
@@ -1976,18 +1975,18 @@ impl V4SignedCurrentnessProof {
     )]
     pub fn verify(
         &self,
-        own_record: &V4DeviceRecord,
-        peer_record: &V4DeviceRecord,
-        hello: &V4SignedHello,
-        expected_role: V4CurrentnessRole,
+        own_record: &V1DeviceRecord,
+        peer_record: &V1DeviceRecord,
+        hello: &V1SignedHello,
+        expected_role: V1CurrentnessRole,
         expected_challenge: &str,
         now: u64,
         allow_loopback_dev: bool,
     ) -> Result<()> {
         ensure_serialized_bound(
             self,
-            V4_MAX_CURRENTNESS_PROOF_BYTES,
-            "v4 currentness proof size",
+            V1_MAX_CURRENTNESS_PROOF_BYTES,
+            "v1 currentness proof size",
         )?;
         Self::validate_claims(
             &self.claims,
@@ -2001,7 +2000,7 @@ impl V4SignedCurrentnessProof {
         )?;
         verify_signature(
             &own_record.certificate.control_public_key()?,
-            V4_CURRENTNESS_DOMAIN,
+            V1_CURRENTNESS_DOMAIN,
             &self.claims,
             &self.signature,
         )
@@ -2015,7 +2014,7 @@ impl V4SignedCurrentnessProof {
     ///
     /// Returns an error if the challenge or any digest is malformed.
     pub fn path(&self) -> Result<String> {
-        v4_currentness_path(
+        v1_currentness_path(
             self.claims.role,
             &self.claims.challenge,
             &self.claims.hello_digest,

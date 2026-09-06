@@ -1,4 +1,4 @@
-//! Bounded homeserver discovery and publication for protocol v4.
+//! Bounded homeserver discovery and publication for protocol v1.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -12,34 +12,34 @@ use std::{
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::StreamExt as _;
-use hole_punchky_protocol::{
-    V4_CURRENTNESS_PATH_PREFIX, V4_DEVICE_RECORD_PATH_PREFIX, V4_MAX_CURRENTNESS_PROOF_BYTES,
-    V4_MAX_DEVICE_RECORD_BYTES, V4DeviceRecord, V4SignedCurrentnessProof, now_seconds,
-};
 use n0_future::time;
 use pubky::{Pubky, PubkySession, PublicKey};
+use pubky2pubky_protocol::{
+    V1_CURRENTNESS_PATH_PREFIX, V1_DEVICE_RECORD_PATH_PREFIX, V1_MAX_CURRENTNESS_PROOF_BYTES,
+    V1_MAX_DEVICE_RECORD_BYTES, V1DeviceRecord, V1SignedCurrentnessProof, now_seconds,
+};
 use tokio::sync::RwLock;
 
 use crate::{AuthenticatedSequenceObservation, ClientError, Result, SequenceStore};
 
-/// Maximum v4 devices discoverable for one Pubky identity.
-pub const V4_MAX_DEVICES: usize = 8;
+/// Maximum v1 devices discoverable for one Pubky identity.
+pub const V1_MAX_DEVICES: usize = 8;
 
-const ABSOLUTE_MAX_TOTAL_BYTES: usize = 8 * V4_MAX_DEVICE_RECORD_BYTES;
+const ABSOLUTE_MAX_TOTAL_BYTES: usize = 8 * V1_MAX_DEVICE_RECORD_BYTES;
 const LIST_DETECTION_LIMIT: u16 = 9;
 
-/// One exact, fully verified self-contained v4 device publication.
+/// One exact, fully verified self-contained v1 device publication.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedV4Device {
+pub struct ResolvedV1Device {
     /// Exact hash-derived public-storage path.
     pub path: String,
     /// Complete Grant authorization, device certificate, and current locator.
-    pub record: V4DeviceRecord,
+    pub record: V1DeviceRecord,
 }
 
-/// Strict resource and timeout bounds for v4 homeserver discovery.
+/// Strict resource and timeout bounds for v1 homeserver discovery.
 #[derive(Debug, Clone)]
-pub struct V4DiscoveryConfig {
+pub struct V1DiscoveryConfig {
     /// Time allowed to receive response headers for one public-storage request.
     pub connect_timeout: Duration,
     /// Total time allowed for one list or exact-fetch operation.
@@ -54,80 +54,80 @@ pub struct V4DiscoveryConfig {
     pub allow_insecure_loopback_relay: bool,
 }
 
-impl Default for V4DiscoveryConfig {
+impl Default for V1DiscoveryConfig {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(10),
             overall_timeout: Duration::from_secs(30),
-            record_max_bytes: V4_MAX_DEVICE_RECORD_BYTES,
+            record_max_bytes: V1_MAX_DEVICE_RECORD_BYTES,
             total_record_max_bytes: ABSOLUTE_MAX_TOTAL_BYTES,
-            currentness_max_bytes: V4_MAX_CURRENTNESS_PROOF_BYTES,
+            currentness_max_bytes: V1_MAX_CURRENTNESS_PROOF_BYTES,
             allow_insecure_loopback_relay: false,
         }
     }
 }
 
-impl V4DiscoveryConfig {
+impl V1DiscoveryConfig {
     fn validate(&self) -> Result<()> {
         if self.connect_timeout.is_zero()
             || self.overall_timeout.is_zero()
             || self.connect_timeout > self.overall_timeout
             || self.record_max_bytes == 0
-            || self.record_max_bytes > V4_MAX_DEVICE_RECORD_BYTES
+            || self.record_max_bytes > V1_MAX_DEVICE_RECORD_BYTES
             || self.total_record_max_bytes < self.record_max_bytes
             || self.total_record_max_bytes > ABSOLUTE_MAX_TOTAL_BYTES
             || self.currentness_max_bytes == 0
-            || self.currentness_max_bytes > V4_MAX_CURRENTNESS_PROOF_BYTES
+            || self.currentness_max_bytes > V1_MAX_CURRENTNESS_PROOF_BYTES
         {
             return Err(ClientError::Discovery(
-                "invalid v4 discovery resource bounds".to_owned(),
+                "invalid v1 discovery resource bounds".to_owned(),
             ));
         }
         Ok(())
     }
 }
 
-/// V4 discovery, exact currentness exchange, and atomic remote-observation boundary.
+/// V1 discovery, exact currentness exchange, and atomic remote-observation boundary.
 ///
 /// [`Self::resolve_devices`] is only for a locally user-selected outbound identity.
 /// [`Self::fetch_currentness_proof`] may use an identity learned from the peer and therefore must
 /// never be called before explicit inbound application consent.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-pub trait V4DeviceResolver: Send + Sync {
+pub trait V1DeviceResolver: Send + Sync {
     /// List and verify up to eight current device records for a user-selected identity.
-    async fn resolve_devices(&self, identity: &str) -> Result<Vec<ResolvedV4Device>>;
+    async fn resolve_devices(&self, identity: &str) -> Result<Vec<ResolvedV1Device>>;
 
     /// Fetch and verify one exact hash-derived device-record path.
-    async fn fetch_device_record(&self, identity: &str, path: &str) -> Result<ResolvedV4Device>;
+    async fn fetch_device_record(&self, identity: &str, path: &str) -> Result<ResolvedV1Device>;
 
     /// Fetch one exact hash-derived currentness-proof path without yet trusting its contents.
     async fn fetch_currentness_proof(
         &self,
         identity: &str,
         path: &str,
-    ) -> Result<V4SignedCurrentnessProof>;
+    ) -> Result<V1SignedCurrentnessProof>;
 
     /// Publish a bounded currentness proof under this resolver's local authenticated identity.
-    async fn publish_currentness_proof(&self, proof: &V4SignedCurrentnessProof) -> Result<()>;
+    async fn publish_currentness_proof(&self, proof: &V1SignedCurrentnessProof) -> Result<()>;
 
     /// Best-effort exact deletion of a proof previously published by this resolver.
-    async fn delete_currentness_proof(&self, proof: &V4SignedCurrentnessProof) -> Result<()>;
+    async fn delete_currentness_proof(&self, proof: &V1SignedCurrentnessProof) -> Result<()>;
 
     /// Atomically commit the digest-bound locator observation after mutual currentness succeeds.
-    async fn commit_remote_record(&self, device: &ResolvedV4Device) -> Result<()>;
+    async fn commit_remote_record(&self, device: &ResolvedV1Device) -> Result<()>;
 }
 
-/// Network-backed v4 resolver and currentness publisher.
+/// Network-backed v1 resolver and currentness publisher.
 #[derive(Clone)]
-pub struct PubkyV4Resolver {
+pub struct PubkyV1Resolver {
     pubky: Pubky,
     session: PubkySession,
     sequences: Arc<dyn SequenceStore>,
-    config: V4DiscoveryConfig,
+    config: V1DiscoveryConfig,
 }
 
-impl PubkyV4Resolver {
+impl PubkyV1Resolver {
     /// Create a resolver using one authenticated local session and durable observation store.
     #[must_use]
     pub fn new(pubky: Pubky, session: PubkySession, sequences: Arc<dyn SequenceStore>) -> Self {
@@ -135,13 +135,13 @@ impl PubkyV4Resolver {
             pubky,
             session,
             sequences,
-            config: V4DiscoveryConfig::default(),
+            config: V1DiscoveryConfig::default(),
         }
     }
 
     /// Override strict discovery bounds and local-test relay policy.
     #[must_use]
-    pub fn with_config(mut self, config: V4DiscoveryConfig) -> Self {
+    pub fn with_config(mut self, config: V1DiscoveryConfig) -> Self {
         self.config = config;
         self
     }
@@ -152,13 +152,13 @@ impl PubkyV4Resolver {
             self.pubky.public_storage().get(address),
         )
         .await
-        .map_err(|_| ClientError::Timeout("connecting to v4 Pubky public storage"))?
+        .map_err(|_| ClientError::Timeout("connecting to v1 Pubky public storage"))?
         .map_err(|error| ClientError::Discovery(error.to_string()))?;
         if response.content_length().is_some_and(|declared| {
             usize::try_from(declared).map_or(true, |length| length > maximum)
         }) {
             return Err(ClientError::Discovery(
-                "v4 discovery record declares an oversized body".to_owned(),
+                "v1 discovery record declares an oversized body".to_owned(),
             ));
         }
         let mut chunks = response.bytes_stream();
@@ -167,7 +167,7 @@ impl PubkyV4Resolver {
             let chunk = chunk.map_err(|error| ClientError::Discovery(error.to_string()))?;
             if chunk.len() > maximum.saturating_sub(bytes.len()) {
                 return Err(ClientError::Discovery(
-                    "v4 discovery record exceeds byte limit".to_owned(),
+                    "v1 discovery record exceeds byte limit".to_owned(),
                 ));
             }
             bytes.extend_from_slice(&chunk);
@@ -175,13 +175,13 @@ impl PubkyV4Resolver {
         Ok(bytes)
     }
 
-    async fn fetch_record_inner(&self, identity: &str, path: &str) -> Result<ResolvedV4Device> {
+    async fn fetch_record_inner(&self, identity: &str, path: &str) -> Result<ResolvedV1Device> {
         validate_device_path(path)?;
         let address = addressed(identity, path)?;
         let bytes = self
             .fetch_bounded(address, self.config.record_max_bytes)
             .await?;
-        let record = V4DeviceRecord::decode_and_verify(
+        let record = V1DeviceRecord::decode_and_verify(
             &bytes,
             identity,
             now_seconds(),
@@ -191,15 +191,15 @@ impl PubkyV4Resolver {
         if record.path()? != path {
             return Err(ClientError::UnexpectedPeer);
         }
-        Ok(ResolvedV4Device {
+        Ok(ResolvedV1Device {
             path: path.to_owned(),
             record,
         })
     }
 
-    async fn resolve_inner(&self, identity: &str) -> Result<Vec<ResolvedV4Device>> {
+    async fn resolve_inner(&self, identity: &str) -> Result<Vec<ResolvedV1Device>> {
         let identity = canonical_identity(identity)?;
-        let prefix_address = addressed(&identity, V4_DEVICE_RECORD_PATH_PREFIX)?;
+        let prefix_address = addressed(&identity, V1_DEVICE_RECORD_PATH_PREFIX)?;
         let entries = self
             .pubky
             .public_storage()
@@ -210,9 +210,9 @@ impl PubkyV4Resolver {
             .send()
             .await
             .map_err(|error| ClientError::Discovery(error.to_string()))?;
-        if entries.len() > V4_MAX_DEVICES {
+        if entries.len() > V1_MAX_DEVICES {
             return Err(ClientError::Discovery(
-                "v4 device listing exceeds the eight-device limit".to_owned(),
+                "v1 device listing exceeds the eight-device limit".to_owned(),
             ));
         }
 
@@ -226,7 +226,7 @@ impl PubkyV4Resolver {
             validate_device_path(path)?;
             if !unique.insert(path.to_owned()) {
                 return Err(ClientError::Discovery(
-                    "duplicate v4 device listing entry".to_owned(),
+                    "duplicate v1 device listing entry".to_owned(),
                 ));
             }
             paths.push(path.to_owned());
@@ -241,10 +241,10 @@ impl PubkyV4Resolver {
                 .map_err(|error| ClientError::Discovery(error.to_string()))?;
             total = total
                 .checked_add(encoded.len())
-                .ok_or_else(|| ClientError::Discovery("v4 byte total overflow".to_owned()))?;
+                .ok_or_else(|| ClientError::Discovery("v1 byte total overflow".to_owned()))?;
             if total > self.config.total_record_max_bytes {
                 return Err(ClientError::Discovery(
-                    "v4 device records exceed aggregate byte limit".to_owned(),
+                    "v1 device records exceed aggregate byte limit".to_owned(),
                 ));
             }
             devices.push(device);
@@ -269,15 +269,15 @@ impl PubkyV4Resolver {
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-impl V4DeviceResolver for PubkyV4Resolver {
-    async fn resolve_devices(&self, identity: &str) -> Result<Vec<ResolvedV4Device>> {
+impl V1DeviceResolver for PubkyV1Resolver {
+    async fn resolve_devices(&self, identity: &str) -> Result<Vec<ResolvedV1Device>> {
         self.config.validate()?;
         time::timeout(self.config.overall_timeout, self.resolve_inner(identity))
             .await
-            .map_err(|_| ClientError::Timeout("listing v4 Pubky devices"))?
+            .map_err(|_| ClientError::Timeout("listing v1 Pubky devices"))?
     }
 
-    async fn fetch_device_record(&self, identity: &str, path: &str) -> Result<ResolvedV4Device> {
+    async fn fetch_device_record(&self, identity: &str, path: &str) -> Result<ResolvedV1Device> {
         self.config.validate()?;
         let identity = canonical_identity(identity)?;
         time::timeout(
@@ -285,14 +285,14 @@ impl V4DeviceResolver for PubkyV4Resolver {
             self.fetch_record_inner(&identity, path),
         )
         .await
-        .map_err(|_| ClientError::Timeout("fetching exact v4 device record"))?
+        .map_err(|_| ClientError::Timeout("fetching exact v1 device record"))?
     }
 
     async fn fetch_currentness_proof(
         &self,
         identity: &str,
         path: &str,
-    ) -> Result<V4SignedCurrentnessProof> {
+    ) -> Result<V1SignedCurrentnessProof> {
         self.config.validate()?;
         let identity = canonical_identity(identity)?;
         validate_currentness_path(path)?;
@@ -304,20 +304,20 @@ impl V4DeviceResolver for PubkyV4Resolver {
             ),
         )
         .await
-        .map_err(|_| ClientError::Timeout("fetching exact v4 currentness proof"))??;
+        .map_err(|_| ClientError::Timeout("fetching exact v1 currentness proof"))??;
         serde_json::from_slice(&bytes)
-            .map_err(|_| ClientError::Discovery("malformed v4 currentness proof".to_owned()))
+            .map_err(|_| ClientError::Discovery("malformed v1 currentness proof".to_owned()))
     }
 
-    async fn publish_currentness_proof(&self, proof: &V4SignedCurrentnessProof) -> Result<()> {
-        publish_v4_currentness_proof(&self.session, proof).await
+    async fn publish_currentness_proof(&self, proof: &V1SignedCurrentnessProof) -> Result<()> {
+        publish_v1_currentness_proof(&self.session, proof).await
     }
 
-    async fn delete_currentness_proof(&self, proof: &V4SignedCurrentnessProof) -> Result<()> {
-        delete_v4_currentness_proof(&self.session, proof).await
+    async fn delete_currentness_proof(&self, proof: &V1SignedCurrentnessProof) -> Result<()> {
+        delete_v1_currentness_proof(&self.session, proof).await
     }
 
-    async fn commit_remote_record(&self, device: &ResolvedV4Device) -> Result<()> {
+    async fn commit_remote_record(&self, device: &ResolvedV1Device) -> Result<()> {
         device.record.verify(
             &device.record.certificate.claims.identity,
             now_seconds(),
@@ -334,22 +334,22 @@ impl V4DeviceResolver for PubkyV4Resolver {
 }
 
 #[derive(Debug, Default)]
-struct StaticV4State {
-    records: RwLock<HashMap<String, V4DeviceRecord>>,
-    proofs: RwLock<HashMap<String, V4SignedCurrentnessProof>>,
+struct StaticV1State {
+    records: RwLock<HashMap<String, V1DeviceRecord>>,
+    proofs: RwLock<HashMap<String, V1SignedCurrentnessProof>>,
 }
 
-/// In-memory v4 resolver/publisher for deterministic tests and offline injection.
+/// In-memory v1 resolver/publisher for deterministic tests and offline injection.
 #[derive(Clone)]
-pub struct StaticV4Resolver {
+pub struct StaticV1Resolver {
     local_identity: String,
-    state: Arc<StaticV4State>,
+    state: Arc<StaticV1State>,
     sequences: Arc<dyn SequenceStore>,
     request_count: Arc<AtomicUsize>,
     allow_insecure_loopback_relay: bool,
 }
 
-impl StaticV4Resolver {
+impl StaticV1Resolver {
     /// Create an isolated resolver for one local identity.
     ///
     /// # Errors
@@ -393,7 +393,7 @@ impl StaticV4Resolver {
     /// # Errors
     ///
     /// Returns an error when the record or derived path is invalid.
-    pub async fn insert_record(&self, record: V4DeviceRecord) -> Result<String> {
+    pub async fn insert_record(&self, record: V1DeviceRecord) -> Result<String> {
         let identity = record.certificate.claims.identity.clone();
         record.verify(
             &identity,
@@ -423,8 +423,8 @@ impl StaticV4Resolver {
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-impl V4DeviceResolver for StaticV4Resolver {
-    async fn resolve_devices(&self, identity: &str) -> Result<Vec<ResolvedV4Device>> {
+impl V1DeviceResolver for StaticV1Resolver {
+    async fn resolve_devices(&self, identity: &str) -> Result<Vec<ResolvedV1Device>> {
         self.note_request();
         let identity = canonical_identity(identity)?;
         let records = self.state.records.read().await;
@@ -433,9 +433,9 @@ impl V4DeviceResolver for StaticV4Resolver {
             if record.certificate.claims.identity != identity {
                 continue;
             }
-            if devices.len() >= V4_MAX_DEVICES {
+            if devices.len() >= V1_MAX_DEVICES {
                 return Err(ClientError::Discovery(
-                    "injected v4 device listing exceeds limit".to_owned(),
+                    "injected v1 device listing exceeds limit".to_owned(),
                 ));
             }
             record.verify(
@@ -444,7 +444,7 @@ impl V4DeviceResolver for StaticV4Resolver {
                 self.allow_insecure_loopback_relay,
                 None,
             )?;
-            devices.push(ResolvedV4Device {
+            devices.push(ResolvedV1Device {
                 path: record.path()?,
                 record: record.clone(),
             });
@@ -453,7 +453,7 @@ impl V4DeviceResolver for StaticV4Resolver {
         Ok(devices)
     }
 
-    async fn fetch_device_record(&self, identity: &str, path: &str) -> Result<ResolvedV4Device> {
+    async fn fetch_device_record(&self, identity: &str, path: &str) -> Result<ResolvedV1Device> {
         self.note_request();
         let identity = canonical_identity(identity)?;
         validate_device_path(path)?;
@@ -464,7 +464,7 @@ impl V4DeviceResolver for StaticV4Resolver {
             .await
             .get(&storage_key(&identity, path))
             .cloned()
-            .ok_or_else(|| ClientError::Discovery("v4 device record not found".to_owned()))?;
+            .ok_or_else(|| ClientError::Discovery("v1 device record not found".to_owned()))?;
         record.verify(
             &identity,
             now_seconds(),
@@ -474,7 +474,7 @@ impl V4DeviceResolver for StaticV4Resolver {
         if record.path()? != path {
             return Err(ClientError::UnexpectedPeer);
         }
-        Ok(ResolvedV4Device {
+        Ok(ResolvedV1Device {
             path: path.to_owned(),
             record,
         })
@@ -484,7 +484,7 @@ impl V4DeviceResolver for StaticV4Resolver {
         &self,
         identity: &str,
         path: &str,
-    ) -> Result<V4SignedCurrentnessProof> {
+    ) -> Result<V1SignedCurrentnessProof> {
         self.note_request();
         let identity = canonical_identity(identity)?;
         validate_currentness_path(path)?;
@@ -494,15 +494,15 @@ impl V4DeviceResolver for StaticV4Resolver {
             .await
             .get(&storage_key(&identity, path))
             .cloned()
-            .ok_or_else(|| ClientError::Discovery("v4 currentness proof not found".to_owned()))
+            .ok_or_else(|| ClientError::Discovery("v1 currentness proof not found".to_owned()))
     }
 
-    async fn publish_currentness_proof(&self, proof: &V4SignedCurrentnessProof) -> Result<()> {
+    async fn publish_currentness_proof(&self, proof: &V1SignedCurrentnessProof) -> Result<()> {
         let encoded =
             serde_json::to_vec(proof).map_err(|error| ClientError::Discovery(error.to_string()))?;
-        if encoded.len() > V4_MAX_CURRENTNESS_PROOF_BYTES {
+        if encoded.len() > V1_MAX_CURRENTNESS_PROOF_BYTES {
             return Err(ClientError::Discovery(
-                "v4 currentness proof exceeds publication limit".to_owned(),
+                "v1 currentness proof exceeds publication limit".to_owned(),
             ));
         }
         let path = proof.path()?;
@@ -514,7 +514,7 @@ impl V4DeviceResolver for StaticV4Resolver {
         Ok(())
     }
 
-    async fn delete_currentness_proof(&self, proof: &V4SignedCurrentnessProof) -> Result<()> {
+    async fn delete_currentness_proof(&self, proof: &V1SignedCurrentnessProof) -> Result<()> {
         let path = proof.path()?;
         self.state
             .proofs
@@ -524,7 +524,7 @@ impl V4DeviceResolver for StaticV4Resolver {
         Ok(())
     }
 
-    async fn commit_remote_record(&self, device: &ResolvedV4Device) -> Result<()> {
+    async fn commit_remote_record(&self, device: &ResolvedV1Device) -> Result<()> {
         let identity = device.record.certificate.claims.identity.clone();
         device.record.verify(
             &identity,
@@ -546,9 +546,9 @@ impl V4DeviceResolver for StaticV4Resolver {
 /// # Errors
 ///
 /// Returns an error unless the session owns the record and the write succeeds.
-pub async fn publish_v4_device_record(
+pub async fn publish_v1_device_record(
     session: &PubkySession,
-    record: &V4DeviceRecord,
+    record: &V1DeviceRecord,
     allow_insecure_loopback_relay: bool,
 ) -> Result<()> {
     let identity = session.public_key().z32();
@@ -560,9 +560,9 @@ pub async fn publish_v4_device_record(
     )?;
     let encoded =
         serde_json::to_vec(record).map_err(|error| ClientError::Discovery(error.to_string()))?;
-    if encoded.len() > V4_MAX_DEVICE_RECORD_BYTES {
+    if encoded.len() > V1_MAX_DEVICE_RECORD_BYTES {
         return Err(ClientError::Discovery(
-            "v4 device record exceeds publication limit".to_owned(),
+            "v1 device record exceeds publication limit".to_owned(),
         ));
     }
     session
@@ -578,9 +578,9 @@ pub async fn publish_v4_device_record(
 /// # Errors
 ///
 /// Returns an error unless the session owns the record or deletion fails.
-pub async fn delete_v4_device_record(
+pub async fn delete_v1_device_record(
     session: &PubkySession,
-    record: &V4DeviceRecord,
+    record: &V1DeviceRecord,
 ) -> Result<()> {
     if session.public_key().z32() != record.certificate.claims.identity {
         return Err(ClientError::UnexpectedPeer);
@@ -601,15 +601,15 @@ pub async fn delete_v4_device_record(
 /// # Errors
 ///
 /// Returns an error for an invalid path, oversized proof, or failed write.
-pub async fn publish_v4_currentness_proof(
+pub async fn publish_v1_currentness_proof(
     session: &PubkySession,
-    proof: &V4SignedCurrentnessProof,
+    proof: &V1SignedCurrentnessProof,
 ) -> Result<()> {
     let encoded =
         serde_json::to_vec(proof).map_err(|error| ClientError::Discovery(error.to_string()))?;
-    if encoded.len() > V4_MAX_CURRENTNESS_PROOF_BYTES {
+    if encoded.len() > V1_MAX_CURRENTNESS_PROOF_BYTES {
         return Err(ClientError::Discovery(
-            "v4 currentness proof exceeds publication limit".to_owned(),
+            "v1 currentness proof exceeds publication limit".to_owned(),
         ));
     }
     session
@@ -625,9 +625,9 @@ pub async fn publish_v4_currentness_proof(
 /// # Errors
 ///
 /// Returns an error for an invalid proof path or failed deletion.
-pub async fn delete_v4_currentness_proof(
+pub async fn delete_v1_currentness_proof(
     session: &PubkySession,
-    proof: &V4SignedCurrentnessProof,
+    proof: &V1SignedCurrentnessProof,
 ) -> Result<()> {
     session
         .storage()
@@ -637,21 +637,24 @@ pub async fn delete_v4_currentness_proof(
     Ok(())
 }
 
-fn record_observation(record: &V4DeviceRecord) -> Result<AuthenticatedSequenceObservation> {
+fn record_observation(record: &V1DeviceRecord) -> Result<AuthenticatedSequenceObservation> {
     let encoded = record.digest()?;
     let bytes = URL_SAFE_NO_PAD
         .decode(&encoded)
-        .map_err(|_| ClientError::State("invalid v4 record digest".to_owned()))?;
+        .map_err(|_| ClientError::State("invalid v1 record digest".to_owned()))?;
     if URL_SAFE_NO_PAD.encode(&bytes) != encoded {
         return Err(ClientError::State(
-            "non-canonical v4 record digest".to_owned(),
+            "non-canonical v1 record digest".to_owned(),
         ));
     }
     let digest = <[u8; 32]>::try_from(bytes.as_slice())
-        .map_err(|_| ClientError::State("invalid v4 record digest length".to_owned()))?;
+        .map_err(|_| ClientError::State("invalid v1 record digest length".to_owned()))?;
     AuthenticatedSequenceObservation::new(
         record.certificate.claims.identity.clone(),
-        format!("locator:{}", record.certificate.claims.control_signing_key),
+        format!(
+            "v1:locator:{}",
+            record.certificate.claims.control_signing_key
+        ),
         record.locator.claims.sequence,
         digest,
     )
@@ -690,11 +693,11 @@ fn validate_hash_path(path: &str, prefix: &str, label: &'static str) -> Result<(
 }
 
 fn validate_device_path(path: &str) -> Result<()> {
-    validate_hash_path(path, V4_DEVICE_RECORD_PATH_PREFIX, "v4 device record")
+    validate_hash_path(path, V1_DEVICE_RECORD_PATH_PREFIX, "v1 device record")
 }
 
 fn validate_currentness_path(path: &str) -> Result<()> {
-    validate_hash_path(path, V4_CURRENTNESS_PATH_PREFIX, "v4 currentness proof")
+    validate_hash_path(path, V1_CURRENTNESS_PATH_PREFIX, "v1 currentness proof")
 }
 
 fn addressed(identity: &str, path: &str) -> Result<String> {
@@ -706,7 +709,7 @@ fn addressed(identity: &str, path: &str) -> Result<String> {
             .any(|character| matches!(character, '?' | '#' | '\\'))
     {
         return Err(ClientError::Discovery(
-            "invalid v4 public-storage path".to_owned(),
+            "invalid v1 public-storage path".to_owned(),
         ));
     }
     Ok(format!("pubky://{identity}{path}"))
@@ -718,8 +721,8 @@ fn storage_key(identity: &str, path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use hole_punchky_protocol::{V4DeviceCredential, V4GrantAuthorization, V4SignedLocator};
     use pubky::{Capability, ClientId, GrantClaims, GrantId, Keypair};
+    use pubky2pubky_protocol::{V1DeviceCredential, V1GrantAuthorization, V1SignedLocator};
     use url::Url;
 
     use super::*;
@@ -729,7 +732,7 @@ mod tests {
         root: &Keypair,
         cnf: &Keypair,
         sequence: u64,
-    ) -> (V4DeviceCredential, V4DeviceRecord) {
+    ) -> (V1DeviceCredential, V1DeviceRecord) {
         let now = now_seconds();
         let claims = GrantClaims {
             iss: root.public_key(),
@@ -744,13 +747,13 @@ mod tests {
             iat: now.saturating_sub(10),
             exp: now + 3_600,
         };
-        let authorization = V4GrantAuthorization::from_jws(
+        let authorization = V1GrantAuthorization::from_jws(
             claims.sign(root, "pubky-grant"),
             &root.public_key().z32(),
             now,
         )
         .unwrap_or_else(|error| panic!("authorization: {error}"));
-        let credential = V4DeviceCredential::issue(
+        let credential = V1DeviceCredential::issue(
             authorization,
             &root.public_key().z32(),
             cnf,
@@ -759,19 +762,19 @@ mod tests {
             now + 1_800,
         )
         .unwrap_or_else(|error| panic!("credential: {error}"));
-        let locator = V4SignedLocator::sign(
+        let locator = V1SignedLocator::sign(
             &credential,
             vec![
                 Url::parse("https://relay.example/")
                     .unwrap_or_else(|error| panic!("relay: {error}")),
             ],
-            hole_punchky_protocol::v4_random_challenge(),
+            pubky2pubky_protocol::v1_random_challenge(),
             sequence,
             now,
             now + 600,
         )
         .unwrap_or_else(|error| panic!("locator: {error}"));
-        let record = V4DeviceRecord::new(&credential, locator, now, false)
+        let record = V1DeviceRecord::new(&credential, locator, now, false)
             .unwrap_or_else(|error| panic!("record: {error}"));
         (credential, record)
     }
@@ -781,7 +784,7 @@ mod tests {
         let root = Keypair::random();
         let cnf = Keypair::random();
         let sequences = Arc::new(MemorySequenceStore::default());
-        let resolver = StaticV4Resolver::new(&root.public_key().z32(), sequences, false)
+        let resolver = StaticV1Resolver::new(&root.public_key().z32(), sequences, false)
             .unwrap_or_else(|error| panic!("resolver: {error}"));
         let (credential, record) = test_record(&root, &cnf, 1);
         let path = resolver
@@ -804,21 +807,21 @@ mod tests {
             .unwrap_or_else(|error| panic!("repeat: {error}"));
 
         let now = now_seconds();
-        let changed_locator = V4SignedLocator::sign(
+        let changed_locator = V1SignedLocator::sign(
             &credential,
             vec![
                 Url::parse("https://other-relay.example/")
                     .unwrap_or_else(|error| panic!("relay: {error}")),
             ],
-            hole_punchky_protocol::v4_random_challenge(),
+            pubky2pubky_protocol::v1_random_challenge(),
             1,
             now,
             now + 600,
         )
         .unwrap_or_else(|error| panic!("locator: {error}"));
-        let equivocation = V4DeviceRecord::new(&credential, changed_locator, now, false)
+        let equivocation = V1DeviceRecord::new(&credential, changed_locator, now, false)
             .unwrap_or_else(|error| panic!("equivocation: {error}"));
-        let equivocation = ResolvedV4Device {
+        let equivocation = ResolvedV1Device {
             path: equivocation
                 .path()
                 .unwrap_or_else(|error| panic!("path: {error}")),
@@ -829,8 +832,8 @@ mod tests {
 
     #[test]
     fn path_validation_rejects_traversal_and_noncanonical_hashes() {
-        assert!(validate_device_path("/pub/pubky2pubky/v4/devices/../x.json").is_err());
-        assert!(validate_currentness_path("/pub/pubky2pubky/v4/currentness/a=.json").is_err());
-        assert!(addressed("not-a-pubky", V4_DEVICE_RECORD_PATH_PREFIX).is_err());
+        assert!(validate_device_path("/pub/pubky2pubky/v1/devices/../x.json").is_err());
+        assert!(validate_currentness_path("/pub/pubky2pubky/v1/currentness/a=.json").is_err());
+        assert!(addressed("not-a-pubky", V1_DEVICE_RECORD_PATH_PREFIX).is_err());
     }
 }

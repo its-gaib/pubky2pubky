@@ -1,19 +1,19 @@
 [package]
-name = "hole-punchky-client"
-description = "Pubky-discovered authenticated iroh client for native and browser v3 peers"
+name = "pubky2pubky-client"
+description = "Pubky-discovered authenticated iroh client for protocol v1"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
 futures-util.workspace = true
-hole-punchky-protocol = { path = "../protocol" }
+pubky2pubky-protocol = { path = "../protocol" }
 n0-future.workspace = true
-n0-watcher.workspace = true
 pubky.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -31,13 +31,11 @@ uuid = { workspace = true, features = ["js"] }
 fs2 = "0.4"
 iroh.workspace = true
 tokio.workspace = true
-tokio-tungstenite.workspace = true
 
 [target.'cfg(all(unix, not(target_arch = "wasm32")))'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
-hole-punchky-rendezvous = { path = "../rendezvous" }
 iroh-relay = { version = "=1.1.0", default-features = false, features = ["server", "tls-ring"] }
 
 [lints]

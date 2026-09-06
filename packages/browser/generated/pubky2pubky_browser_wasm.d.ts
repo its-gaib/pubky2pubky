@@ -9,7 +9,7 @@
 export type ReadableStreamType = "bytes";
 
 /**
- * Browser-owned authentication, device-state, and v4 relay-only network core.
+ * Browser-owned authentication, device-state, and v1 relay-only network core.
  */
 export class BrowserCore {
     free(): void;
@@ -48,7 +48,7 @@ export class BrowserCore {
      */
     constructor(on_event: Function);
     /**
-     * Prepare or restore the protected v4 device credential. This does not claim network success.
+     * Prepare or restore the protected v1 device credential. This does not claim network success.
      */
     prepareDevice(device_id: string): Promise<any>;
     /**
@@ -143,7 +143,7 @@ export interface InitOutput {
     readonly wasm_bindgen__convert__closures_____invoke__h51b1f1bcebfca655: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h28f7d93b133d0813: (a: number, b: number, c: any, d: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__hde6f166c283822a3: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h354fcefe2c4d66dc: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h43b603e807df0346: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h208de9cb13c09a06: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h7de5358ffcde78cb: (a: number, b: number) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h66edf16271dd4c69: (a: number, b: number) => void;

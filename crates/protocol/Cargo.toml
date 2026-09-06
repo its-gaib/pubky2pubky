@@ -1,16 +1,16 @@
 [package]
-name = "hole-punchky-protocol"
-description = "Signed and encrypted wire protocol for Hole Punchky"
+name = "pubky2pubky-protocol"
+description = "Signed identity, discovery, and handshake types for pubky2pubky protocol v1"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 
 [dependencies]
 base64.workspace = true
 ed25519-dalek.workspace = true
-hpke.workspace = true
 pubky-common.workspace = true
 serde.workspace = true
 serde_jcs.workspace = true
@@ -18,12 +18,8 @@ serde_json.workspace = true
 sha2 = "0.10"
 thiserror.workspace = true
 url.workspace = true
-uuid.workspace = true
 web-time.workspace = true
 zeroize.workspace = true
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-uuid = { workspace = true, features = ["js"] }
 
 [lints]
 workspace = true

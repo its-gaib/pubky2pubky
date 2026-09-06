@@ -1,6 +1,21 @@
 # pubky2pubky
 
-pubky2pubky maps a Pubky identity to authenticated iroh QUIC endpoints. Protocol v3 is an
+> **Current protocol:** the browser-capable design is protocol v4, which replaces
+> v3's root-signed device directory with standard Pubky 0.11 Grants and mutual live-authority
+> proofs. See [the v4 design](docs/v4.md). V3 remains available as the preceding experimental wire
+> format; clients never downgrade automatically.
+
+pubky2pubky maps a Pubky identity to authenticated iroh QUIC endpoints. Protocol v4 uses the
+unmodified Pubky stack for signed discovery and live delegated-authority proofs; Iroh carries the
+end-to-end encrypted application bytes. The browser package is exported as `pubky2pubky/browser`.
+
+```text
+Pubky ID -> PKARR -> homeserver -> signed v4 device record -> iroh QUIC -> live proofs -> messages
+```
+
+## Protocol v3 compatibility
+
+Protocol v3 is an
 additive, rendezvous-free design: PKARR locates the identity's unmodified homeserver, public
 storage provides a root-signed device directory and short-lived device-signed relay locators, and
 iroh supplies an encrypted relay path plus direct UDP hole punching on native platforms.

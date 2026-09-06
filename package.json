@@ -1,18 +1,32 @@
 {
-  "name": "hole-punchky-specifications",
+  "name": "pubky2pubky",
   "version": "0.1.0",
   "private": true,
-  "description": "Reproducible validators for Hole Punchky API specifications",
+  "type": "module",
+  "description": "Pubky-discovered, end-to-end encrypted browser and native peer transport",
+  "exports": {
+    "./browser": {
+      "types": "./packages/browser/index.d.ts",
+      "import": "./packages/browser/index.js"
+    }
+  },
+  "files": [
+    "packages/browser"
+  ],
   "engines": {
     "node": ">=20.19"
   },
   "scripts": {
+    "build:browser": "bash scripts/build-browser.sh",
+    "check:browser-artifact": "bash scripts/check-browser-artifact.sh",
+    "test:browser": "node --test packages/browser/test/*.test.js",
     "lint:asyncapi": "node scripts/validate-asyncapi.mjs",
     "lint:openapi": "redocly lint docs/openapi.yaml",
     "lint:schemas": "npm run lint:openapi && npm run lint:asyncapi"
   },
   "devDependencies": {
     "@asyncapi/parser": "3.6.3",
-    "@redocly/cli": "2.51.0"
+    "@redocly/cli": "2.51.0",
+    "fake-indexeddb": "6.2.5"
   }
 }

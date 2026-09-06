@@ -10,6 +10,7 @@ mod error;
 mod identity;
 mod message;
 mod v3;
+mod v4;
 
 pub use crypto::{
     EncryptedSignal, IrohEndpointAddress, MAX_IROH_DIRECT_ADDRESSES, MAX_IROH_RELAY_URLS,
@@ -31,6 +32,18 @@ pub use v3::{
     V3_PROTOCOL_VERSION, V3AckClaims, V3DeviceCertificate, V3DeviceCertificateClaims,
     V3DeviceCredential, V3DeviceDirectory, V3DeviceDirectoryClaims, V3HelloClaims, V3LocatorClaims,
     V3SignedAck, V3SignedHello, V3SignedLocator, v3_locator_path, v3_random_nonce,
+};
+pub use v4::{
+    V4_CURRENTNESS_PATH_PREFIX, V4_DEVICE_RECORD_PATH_PREFIX, V4_IROH_ALPN, V4_IROH_ALPN_TEXT,
+    V4_MAX_ACK_BYTES, V4_MAX_CURRENTNESS_LIFETIME_SECONDS, V4_MAX_CURRENTNESS_PROOF_BYTES,
+    V4_MAX_DEVICE_CERTIFICATE_LIFETIME_SECONDS, V4_MAX_DEVICE_RECORD_BYTES,
+    V4_MAX_GRANT_CAPABILITIES, V4_MAX_GRANT_JWS_BYTES, V4_MAX_GRANT_LIFETIME_SECONDS,
+    V4_MAX_HANDSHAKE_LIFETIME_SECONDS, V4_MAX_HELLO_BYTES, V4_MAX_LOCATOR_LIFETIME_SECONDS,
+    V4_MAX_RELAY_URLS, V4_PROTOCOL_VERSION, V4_REQUIRED_STORAGE_SCOPE, V4AckClaims,
+    V4CurrentnessClaims, V4CurrentnessRole, V4DeviceCertificate, V4DeviceCertificateClaims,
+    V4DeviceCredential, V4DeviceCredentialDraft, V4DeviceRecord, V4GrantAuthorization,
+    V4HelloClaims, V4LocatorClaims, V4SignedAck, V4SignedCurrentnessProof, V4SignedHello,
+    V4SignedLocator, v4_currentness_path, v4_device_record_path, v4_random_challenge,
 };
 
 /// Current wire protocol version.

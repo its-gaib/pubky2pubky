@@ -1,0 +1,21 @@
+{
+  "name": "pubky2pubky-browser-wasm",
+  "type": "module",
+  "description": "Browser bindings for Pubky delegated auth and pubky2pubky v4",
+  "version": "0.1.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/its-gaib/pubky2pubky"
+  },
+  "files": [
+    "pubky2pubky_browser_wasm_bg.wasm",
+    "pubky2pubky_browser_wasm.js",
+    "pubky2pubky_browser_wasm.d.ts"
+  ],
+  "main": "pubky2pubky_browser_wasm.js",
+  "types": "pubky2pubky_browser_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}

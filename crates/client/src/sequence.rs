@@ -18,9 +18,99 @@ use crate::{ClientError, Result};
 const STATE_FILE: &str = "sequences.json";
 #[cfg(not(target_arch = "wasm32"))]
 const LOCK_FILE: &str = ".sequences.lock";
-#[cfg(not(target_arch = "wasm32"))]
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const MAX_STATE_ENTRIES: usize = 4_096;
+
+/// One authenticated monotonic record that can be committed with related observations.
+///
+/// Construction validates the canonical Pubky identity, scope grammar, and positive counter.
+/// The digest must authenticate the complete record whose counter is being observed, not just the
+/// counter itself. This lets a store reject equivocation at an already-observed counter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedSequenceObservation {
+    identity: String,
+    scope: String,
+    counter: u64,
+    digest: [u8; 32],
+}
+
+impl AuthenticatedSequenceObservation {
+    /// Construct a validated authenticated sequence observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-canonical identity, invalid scope, or zero counter.
+    pub fn new(
+        identity: impl Into<String>,
+        scope: impl Into<String>,
+        counter: u64,
+        digest: [u8; 32],
+    ) -> Result<Self> {
+        let identity = identity.into();
+        let scope = scope.into();
+        state_key(&identity, &scope)?;
+        if counter == 0 {
+            return Err(ClientError::State(
+                "sequence values must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(Self {
+            identity,
+            scope,
+            counter,
+            digest,
+        })
+    }
+
+    /// Return the canonical Pubky identity.
+    #[must_use]
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// Return the validated application scope.
+    #[must_use]
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
+
+    /// Return the positive monotonic counter.
+    #[must_use]
+    pub const fn counter(&self) -> u64 {
+        self.counter
+    }
+
+    /// Return the authenticated digest of the complete observed record.
+    #[must_use]
+    pub const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+enum StoredSequence {
+    Legacy(u64),
+    Authenticated(AuthenticatedStoredSequence),
+}
+
+impl StoredSequence {
+    const fn counter(&self) -> u64 {
+        match self {
+            Self::Legacy(counter) => *counter,
+            Self::Authenticated(record) => record.counter,
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatedStoredSequence {
+    counter: u64,
+    digest: [u8; 32],
+}
+
+type SequenceState = BTreeMap<String, StoredSequence>;
 
 /// Atomically remembers the greatest authenticated generation or sequence seen for a key.
 ///
@@ -30,7 +120,29 @@ const MAX_STATE_ENTRIES: usize = 4_096;
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait SequenceStore: Send + Sync {
     /// Record an authenticated monotonic value, rejecting rollback.
+    ///
+    /// This legacy API does not bind equal counters to a digest. New callers should use
+    /// [`Self::record_batch`]. An equal legacy counter cannot be reconciled with an existing
+    /// digest-bound observation and therefore fails closed.
     async fn record(&self, identity: &str, scope: &str, value: u64) -> Result<()>;
+
+    /// Atomically commit digest-bound authenticated observations.
+    ///
+    /// The entire batch is rejected without mutation if any observation rolls back, equivocates,
+    /// conflicts with another observation for the same key, or exceeds a store bound. Existing
+    /// implementations retain source compatibility, but fail closed until they override this
+    /// method with a transactional implementation.
+    async fn record_batch(
+        &self,
+        observations: Vec<AuthenticatedSequenceObservation>,
+    ) -> Result<()> {
+        if observations.is_empty() {
+            return Ok(());
+        }
+        Err(ClientError::State(
+            "sequence store does not support atomic authenticated batches".to_owned(),
+        ))
+    }
 }
 
 /// Allocate strictly increasing locator publication sequences.
@@ -52,7 +164,7 @@ pub trait PublisherSequenceStore: Send + Sync {
 /// can lose rollback protection or reuse publisher sequences after a reload.
 #[derive(Debug, Clone, Default)]
 pub struct MemorySequenceStore {
-    values: Arc<Mutex<BTreeMap<String, u64>>>,
+    values: Arc<Mutex<SequenceState>>,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -66,7 +178,20 @@ impl SequenceStore for MemorySequenceStore {
         }
         let key = state_key(identity, scope)?;
         let mut values = self.values.lock().await;
-        record_value(&mut values, key, value)
+        update_memory(&mut values, |staged| {
+            record_legacy_value(staged, key, value)
+        })
+    }
+
+    async fn record_batch(
+        &self,
+        observations: Vec<AuthenticatedSequenceObservation>,
+    ) -> Result<()> {
+        let observations = prepare_batch(observations)?;
+        let mut values = self.values.lock().await;
+        update_memory(&mut values, |staged| {
+            record_authenticated_batch(staged, observations)
+        })
     }
 }
 
@@ -83,7 +208,7 @@ impl MemorySequenceStore {
     ) -> Result<()> {
         let key = publisher_key(identity, control_key)?;
         let mut values = self.values.lock().await;
-        initialize_publisher(&mut values, key)
+        update_memory(&mut values, |staged| initialize_publisher(staged, key))
     }
 }
 
@@ -93,7 +218,7 @@ impl PublisherSequenceStore for MemorySequenceStore {
     async fn next_locator_sequence(&self, identity: &str, control_key: &str) -> Result<u64> {
         let key = publisher_key(identity, control_key)?;
         let mut values = self.values.lock().await;
-        next_publisher_value(&mut values, &key)
+        update_memory(&mut values, |staged| next_publisher_value(staged, &key))
     }
 }
 
@@ -190,7 +315,26 @@ impl SequenceStore for FileSequenceStore {
         let directory = Arc::clone(&self.directory);
         let path = self.state_path();
         tokio::task::spawn_blocking(move || {
-            update_file(&directory, &path, |values| record_value(values, key, value))
+            update_file(&directory, &path, |values| {
+                record_legacy_value(values, key, value)
+            })
+        })
+        .await
+        .map_err(|error| ClientError::State(format!("state writer stopped: {error}")))?
+    }
+
+    async fn record_batch(
+        &self,
+        observations: Vec<AuthenticatedSequenceObservation>,
+    ) -> Result<()> {
+        let observations = prepare_batch(observations)?;
+        let _guard = self.update_lock.lock().await;
+        let directory = Arc::clone(&self.directory);
+        let path = self.state_path();
+        tokio::task::spawn_blocking(move || {
+            update_file(&directory, &path, |values| {
+                record_authenticated_batch(values, observations)
+            })
         })
         .await
         .map_err(|error| ClientError::State(format!("state writer stopped: {error}")))?
@@ -245,22 +389,97 @@ fn publisher_key(identity: &str, control_key: &str) -> Result<String> {
     state_key(identity, &format!("publisher:{control_key}"))
 }
 
-fn record_value(values: &mut BTreeMap<String, u64>, key: String, value: u64) -> Result<()> {
-    if values.get(&key).is_some_and(|previous| value < *previous) {
-        return Err(ClientError::State(
-            "authenticated record rolled back".to_owned(),
-        ));
+fn prepare_batch(
+    observations: Vec<AuthenticatedSequenceObservation>,
+) -> Result<BTreeMap<String, (u64, [u8; 32])>> {
+    let mut prepared = BTreeMap::new();
+    for observation in observations {
+        let key = state_key(&observation.identity, &observation.scope)?;
+        let value = (observation.counter, observation.digest);
+        if let Some(previous) = prepared.insert(key, value)
+            && previous != value
+        {
+            return Err(ClientError::State(
+                "authenticated batch contains conflicting duplicate keys".to_owned(),
+            ));
+        }
     }
-    if !values.contains_key(&key) && values.len() >= MAX_STATE_ENTRIES {
-        return Err(ClientError::State(
-            "sequence store reached its entry limit".to_owned(),
-        ));
+    Ok(prepared)
+}
+
+fn record_authenticated_batch(
+    values: &mut SequenceState,
+    observations: BTreeMap<String, (u64, [u8; 32])>,
+) -> Result<()> {
+    for (key, (counter, digest)) in observations {
+        record_authenticated_value(values, key, counter, digest)?;
     }
-    values.insert(key, value);
     Ok(())
 }
 
-fn initialize_publisher(values: &mut BTreeMap<String, u64>, key: String) -> Result<()> {
+fn record_authenticated_value(
+    values: &mut SequenceState,
+    key: String,
+    counter: u64,
+    digest: [u8; 32],
+) -> Result<()> {
+    match values.get(&key) {
+        Some(previous) if counter < previous.counter() => {
+            return Err(ClientError::State(
+                "authenticated record rolled back".to_owned(),
+            ));
+        }
+        Some(StoredSequence::Legacy(previous)) if counter == *previous => {
+            return Err(ClientError::State(
+                "equal counter was previously stored without an authenticated digest".to_owned(),
+            ));
+        }
+        Some(StoredSequence::Authenticated(previous)) if counter == previous.counter => {
+            if digest == previous.digest {
+                return Ok(());
+            }
+            return Err(ClientError::State(
+                "authenticated record equivocated at an existing counter".to_owned(),
+            ));
+        }
+        None if values.len() >= MAX_STATE_ENTRIES => {
+            return Err(ClientError::State(
+                "sequence store reached its entry limit".to_owned(),
+            ));
+        }
+        Some(_) | None => {}
+    }
+    values.insert(
+        key,
+        StoredSequence::Authenticated(AuthenticatedStoredSequence { counter, digest }),
+    );
+    Ok(())
+}
+
+fn record_legacy_value(values: &mut SequenceState, key: String, value: u64) -> Result<()> {
+    match values.get(&key) {
+        Some(previous) if value < previous.counter() => {
+            return Err(ClientError::State(
+                "authenticated record rolled back".to_owned(),
+            ));
+        }
+        Some(StoredSequence::Authenticated(previous)) if value == previous.counter => {
+            return Err(ClientError::State(
+                "legacy observation cannot verify the stored authenticated digest".to_owned(),
+            ));
+        }
+        None if values.len() >= MAX_STATE_ENTRIES => {
+            return Err(ClientError::State(
+                "sequence store reached its entry limit".to_owned(),
+            ));
+        }
+        Some(_) | None => {}
+    }
+    values.insert(key, StoredSequence::Legacy(value));
+    Ok(())
+}
+
+fn initialize_publisher(values: &mut SequenceState, key: String) -> Result<()> {
     if values.contains_key(&key) {
         return Err(ClientError::State(
             "publisher counter is already initialized; rotate the device certificate".to_owned(),
@@ -271,20 +490,51 @@ fn initialize_publisher(values: &mut BTreeMap<String, u64>, key: String) -> Resu
             "sequence store reached its entry limit".to_owned(),
         ));
     }
-    values.insert(key, 0);
+    values.insert(key, StoredSequence::Legacy(0));
     Ok(())
 }
 
-fn next_publisher_value(values: &mut BTreeMap<String, u64>, key: &str) -> Result<u64> {
+fn next_publisher_value(values: &mut SequenceState, key: &str) -> Result<u64> {
     let value = values.get_mut(key).ok_or_else(|| {
         ClientError::State(
             "publisher state is missing; rotate the root-signed device certificate".to_owned(),
         )
     })?;
+    let StoredSequence::Legacy(value) = value else {
+        return Err(ClientError::State(
+            "publisher counter conflicts with authenticated sequence state; rotate the device certificate"
+                .to_owned(),
+        ));
+    };
     *value = value.checked_add(1).ok_or_else(|| {
         ClientError::State("publisher sequence exhausted; rotate the device certificate".to_owned())
     })?;
     Ok(*value)
+}
+
+fn update_memory<T>(
+    values: &mut SequenceState,
+    update: impl FnOnce(&mut SequenceState) -> Result<T>,
+) -> Result<T> {
+    let mut staged = values.clone();
+    let result = update(&mut staged)?;
+    validate_state_bounds(&staged)?;
+    *values = staged;
+    Ok(result)
+}
+
+fn validate_state_bounds(values: &SequenceState) -> Result<()> {
+    if values.len() > MAX_STATE_ENTRIES {
+        return Err(ClientError::State(
+            "sequence store reached its entry limit".to_owned(),
+        ));
+    }
+    let encoded =
+        serde_json::to_vec(values).map_err(|error| ClientError::State(error.to_string()))?;
+    if encoded.len() as u64 > MAX_STATE_BYTES {
+        return Err(ClientError::State("sequence state is too large".to_owned()));
+    }
+    Ok(())
 }
 
 #[cfg(all(unix, not(target_arch = "wasm32")))]
@@ -307,16 +557,14 @@ fn create_private_directory(path: &Path) -> Result<()> {
 fn update_file<T>(
     directory: &Path,
     path: &Path,
-    update: impl FnOnce(&mut BTreeMap<String, u64>) -> Result<T>,
+    update: impl FnOnce(&mut SequenceState) -> Result<T>,
 ) -> Result<T> {
     let lock = open_and_lock(directory)?;
     let mut values = read_state(path)?;
     let result = update(&mut values)?;
+    validate_state_bounds(&values)?;
     let encoded =
         serde_json::to_vec(&values).map_err(|error| ClientError::State(error.to_string()))?;
-    if encoded.len() as u64 > MAX_STATE_BYTES {
-        return Err(ClientError::State("sequence state is too large".to_owned()));
-    }
 
     let temporary = directory.join(format!(".sequences-{}.tmp", Uuid::new_v4()));
     let write_result = (|| -> Result<()> {
@@ -340,7 +588,7 @@ fn update_file<T>(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn read_state(path: &Path) -> Result<BTreeMap<String, u64>> {
+fn read_state(path: &Path) -> Result<SequenceState> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
@@ -367,14 +615,44 @@ fn read_state(path: &Path) -> Result<BTreeMap<String, u64>> {
     if bytes.len() as u64 > MAX_STATE_BYTES {
         return Err(ClientError::State("sequence state is too large".to_owned()));
     }
-    let values: BTreeMap<String, u64> =
+    let values: SequenceState =
         serde_json::from_slice(&bytes).map_err(|error| ClientError::State(error.to_string()))?;
-    if values.len() > MAX_STATE_ENTRIES {
-        return Err(ClientError::State(
-            "sequence state has too many entries".to_owned(),
-        ));
+    validate_state_bounds(&values)?;
+    for (key, value) in &values {
+        validate_stored_entry(key, value)?;
     }
     Ok(values)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_stored_entry(key: &str, value: &StoredSequence) -> Result<()> {
+    let (identity, scope) = key
+        .split_once(':')
+        .ok_or_else(|| ClientError::State("invalid sequence state key".to_owned()))?;
+    if state_key(identity, scope)? != key {
+        return Err(ClientError::State(
+            "non-canonical sequence state key".to_owned(),
+        ));
+    }
+    match value {
+        StoredSequence::Authenticated(record) if record.counter == 0 => Err(ClientError::State(
+            "authenticated sequence state contains a zero counter".to_owned(),
+        )),
+        StoredSequence::Legacy(0) if !valid_publisher_scope(scope) => Err(ClientError::State(
+            "legacy sequence state contains a zero non-publisher counter".to_owned(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn valid_publisher_scope(scope: &str) -> bool {
+    let Some(control_key) = scope.strip_prefix("publisher:") else {
+        return false;
+    };
+    control_key
+        .parse::<pubky::PublicKey>()
+        .is_ok_and(|parsed| parsed.z32() == control_key)
 }
 
 #[cfg(all(unix, not(target_arch = "wasm32")))]
@@ -499,6 +777,16 @@ mod tests {
 
     use super::*;
 
+    fn observation(
+        identity: &str,
+        scope: &str,
+        counter: u64,
+        digest_byte: u8,
+    ) -> AuthenticatedSequenceObservation {
+        AuthenticatedSequenceObservation::new(identity, scope, counter, [digest_byte; 32])
+            .unwrap_or_else(|error| panic!("valid observation: {error}"))
+    }
+
     #[tokio::test]
     async fn memory_store_allows_repeat_and_rejects_rollback() {
         let identity = Keypair::random().public_key().z32();
@@ -512,6 +800,198 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("repeat record: {error}"));
         assert!(store.record(&identity, "directory", 1).await.is_err());
+    }
+
+    #[test]
+    fn authenticated_observation_validates_its_owned_fields() {
+        let identity = Keypair::random().public_key().z32();
+        let record =
+            AuthenticatedSequenceObservation::new(identity.clone(), "locator:device", 7, [42; 32])
+                .unwrap_or_else(|error| panic!("valid observation: {error}"));
+        assert_eq!(record.identity(), identity);
+        assert_eq!(record.scope(), "locator:device");
+        assert_eq!(record.counter(), 7);
+        assert_eq!(record.digest(), &[42; 32]);
+        assert!(
+            AuthenticatedSequenceObservation::new(identity.clone(), "directory", 0, [0; 32])
+                .is_err()
+        );
+        assert!(
+            AuthenticatedSequenceObservation::new(identity, "invalid/scope", 1, [0; 32]).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_authenticated_batch_is_atomic_and_binds_equal_counters() {
+        let identity = Keypair::random().public_key().z32();
+        let store = MemorySequenceStore::default();
+        let directory = observation(&identity, "directory", 2, 10);
+        store
+            .record_batch(vec![directory.clone()])
+            .await
+            .unwrap_or_else(|error| panic!("initial batch: {error}"));
+        store
+            .record_batch(vec![directory])
+            .await
+            .unwrap_or_else(|error| panic!("equal record with same digest: {error}"));
+        assert!(
+            store
+                .record_batch(vec![observation(&identity, "directory", 2, 11)])
+                .await
+                .is_err(),
+            "an equal counter with a different digest must be rejected"
+        );
+        assert!(
+            store
+                .record_batch(vec![observation(&identity, "directory", 1, 10)])
+                .await
+                .is_err(),
+            "a lower counter must be rejected"
+        );
+
+        assert!(
+            store
+                .record_batch(vec![
+                    observation(&identity, "locator:new", 1, 20),
+                    observation(&identity, "directory", 1, 10),
+                ])
+                .await
+                .is_err(),
+            "one invalid observation must roll back the whole batch"
+        );
+        store
+            .record_batch(vec![observation(&identity, "locator:new", 1, 21)])
+            .await
+            .unwrap_or_else(|error| panic!("rolled-back key must remain absent: {error}"));
+    }
+
+    #[tokio::test]
+    async fn authenticated_batch_rejects_conflicting_duplicates() {
+        let identity = Keypair::random().public_key().z32();
+        let store = MemorySequenceStore::default();
+        assert!(
+            store
+                .record_batch(vec![
+                    observation(&identity, "directory", 1, 1),
+                    observation(&identity, "directory", 2, 1),
+                ])
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .record_batch(vec![
+                    observation(&identity, "directory", 1, 1),
+                    observation(&identity, "directory", 1, 2),
+                ])
+                .await
+                .is_err()
+        );
+        store
+            .record_batch(vec![
+                observation(&identity, "directory", 1, 3),
+                observation(&identity, "directory", 1, 3),
+            ])
+            .await
+            .unwrap_or_else(|error| panic!("identical duplicates are idempotent: {error}"));
+    }
+
+    #[tokio::test]
+    async fn file_authenticated_batch_persists_and_rolls_back_atomically() {
+        let base = std::env::temp_dir().join(format!("p2p-v3-auth-sequence-{}", Uuid::new_v4()));
+        let identity = Keypair::random().public_key().z32();
+        let first =
+            FileSequenceStore::new(&base).unwrap_or_else(|error| panic!("creating store: {error}"));
+        first
+            .record_batch(vec![
+                observation(&identity, "directory", 4, 30),
+                observation(&identity, "locator:one", 8, 31),
+            ])
+            .await
+            .unwrap_or_else(|error| panic!("writing batch: {error}"));
+
+        let reopened = FileSequenceStore::new(&base)
+            .unwrap_or_else(|error| panic!("reopening store: {error}"));
+        reopened
+            .record_batch(vec![observation(&identity, "directory", 4, 30)])
+            .await
+            .unwrap_or_else(|error| panic!("persisted equal observation: {error}"));
+        assert!(
+            reopened
+                .record_batch(vec![observation(&identity, "directory", 4, 32)])
+                .await
+                .is_err()
+        );
+        assert!(
+            reopened
+                .record_batch(vec![
+                    observation(&identity, "locator:two", 1, 40),
+                    observation(&identity, "locator:one", 7, 31),
+                ])
+                .await
+                .is_err()
+        );
+
+        let after_failed_batch = FileSequenceStore::new(&base)
+            .unwrap_or_else(|error| panic!("reopening after failed batch: {error}"));
+        after_failed_batch
+            .record_batch(vec![observation(&identity, "locator:two", 1, 41)])
+            .await
+            .unwrap_or_else(|error| panic!("failed batch must not persist new key: {error}"));
+        fs::remove_dir_all(&base).unwrap_or_else(|error| panic!("cleanup: {error}"));
+    }
+
+    #[tokio::test]
+    async fn legacy_file_state_is_compatible_and_migrates_fail_closed() {
+        let base = std::env::temp_dir().join(format!("p2p-v3-legacy-sequence-{}", Uuid::new_v4()));
+        let identity = Keypair::random().public_key().z32();
+        let store =
+            FileSequenceStore::new(&base).unwrap_or_else(|error| panic!("creating store: {error}"));
+        store
+            .record(&identity, "directory", 5)
+            .await
+            .unwrap_or_else(|error| panic!("writing legacy record: {error}"));
+        let legacy_json = fs::read_to_string(base.join(STATE_FILE))
+            .unwrap_or_else(|error| panic!("reading legacy JSON: {error}"));
+        let legacy_value: serde_json::Value = serde_json::from_str(&legacy_json)
+            .unwrap_or_else(|error| panic!("parsing legacy JSON: {error}"));
+        assert_eq!(legacy_value[format!("{identity}:directory")], 5);
+
+        let reopened = FileSequenceStore::new(&base)
+            .unwrap_or_else(|error| panic!("reopening legacy store: {error}"));
+        reopened
+            .record(&identity, "directory", 5)
+            .await
+            .unwrap_or_else(|error| panic!("repeating legacy record: {error}"));
+        assert!(
+            reopened
+                .record_batch(vec![observation(&identity, "directory", 5, 50)])
+                .await
+                .is_err(),
+            "an equal legacy counter has no digest to compare"
+        );
+        reopened
+            .record_batch(vec![observation(&identity, "directory", 6, 51)])
+            .await
+            .unwrap_or_else(|error| panic!("migrating above legacy floor: {error}"));
+        assert!(
+            reopened.record(&identity, "directory", 6).await.is_err(),
+            "legacy equality cannot verify a migrated digest"
+        );
+
+        let migrated = FileSequenceStore::new(&base)
+            .unwrap_or_else(|error| panic!("reopening migrated store: {error}"));
+        migrated
+            .record_batch(vec![observation(&identity, "directory", 6, 51)])
+            .await
+            .unwrap_or_else(|error| panic!("persisted migrated digest: {error}"));
+        assert!(
+            migrated
+                .record_batch(vec![observation(&identity, "directory", 6, 52)])
+                .await
+                .is_err()
+        );
+        fs::remove_dir_all(&base).unwrap_or_else(|error| panic!("cleanup: {error}"));
     }
 
     #[cfg(unix)]

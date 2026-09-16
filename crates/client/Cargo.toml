@@ -36,7 +36,7 @@ tokio.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
-iroh-relay = { version = "=1.1.0", default-features = false, features = ["server", "tls-ring"] }
+iroh-relay = { version = "=1.2.0", default-features = false, features = ["server", "tls-ring"] }
 
 [lints]
 workspace = true

@@ -3160,12 +3160,12 @@ checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
 
 [[package]]
 name = "pubky"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15a7b191157d57d5095f1577c8064aeda85f96606957fcf4c0a6f4b675adb96d"
+checksum = "2cb8b165e382cc771746ee385e07bac22e421c6fa4626113348709df4f0737a1"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "cookie",
  "eventsource-stream",
  "flume 0.11.1",
@@ -3173,9 +3173,10 @@ dependencies = [
  "futures-util",
  "httpdate",
  "log",
+ "lru 0.18.3",
  "percent-encoding",
  "pkarr",
- "pubky-common",
+ "pubky-common 0.12.0",
  "reqwest",
  "rustls",
  "serde",
@@ -3197,6 +3198,28 @@ checksum = "6ee26f4cf7d9d11a300180b351f1ea0efebf17ec66f0e615a8867f8aba47dc5f"
 dependencies = [
  "argon2",
  "base64 0.22.1",
+ "blake3",
+ "crypto_secretbox",
+ "ed25519-dalek",
+ "percent-encoding",
+ "pkarr",
+ "postcard",
+ "pubky-timestamp",
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "url",
+]
+
+[[package]]
+name = "pubky-common"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3742daf26507f5c7e93ecaf4f9377bf23fc4e8cc8e5931c2a192879e191bf8b"
+dependencies = [
+ "argon2",
+ "base64 0.23.1",
  "blake3",
  "crypto_secretbox",
  "ed25519-dalek",
@@ -3236,7 +3259,7 @@ dependencies = [
  "js-sys",
  "n0-future",
  "pubky",
- "pubky-common",
+ "pubky-common 0.11.0",
  "pubky2pubky-client",
  "pubky2pubky-protocol",
  "serde",
@@ -3277,7 +3300,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
- "pubky-common",
+ "pubky-common 0.11.0",
  "serde",
  "serde_jcs",
  "serde_json",
